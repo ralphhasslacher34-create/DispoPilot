@@ -1,0 +1,46 @@
+name: Build DispoPilot SharePoint package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'dispopilot-webpart.html'
+      - '.github/workflows/build-sppkg.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install CLI for Microsoft 365
+        run: npm install -g @pnp/cli-microsoft365
+
+      - name: Generate SPFx package
+        run: |
+          mkdir -p dist
+          cd dist
+          m365 spfx package generate             --webPartTitle "DispoPilot"             --webPartDescription "DispoPilot Online Pilot V1.3"             --name "dispopilot-online-v13"             --html @../dispopilot-webpart.html             --exposePageContextGlobally
+          echo "Generated packages:"
+          find . -type f -name '*.sppkg' -print
+
+      - name: Collect package
+        run: |
+          mkdir -p artifact
+          PKG=$(find dist -type f -name '*.sppkg' | head -n 1)
+          test -n "$PKG"
+          cp "$PKG" artifact/DispoPilot_Online_V1.3.sppkg
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DispoPilot-Online-V1.3
+          path: artifact/DispoPilot_Online_V1.3.sppkg
+          if-no-files-found: error

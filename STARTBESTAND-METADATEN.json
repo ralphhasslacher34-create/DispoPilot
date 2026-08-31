@@ -1,0 +1,15 @@
+{
+  "sourceAppVersion": "V1.3",
+  "schemaVersion": 4,
+  "backupLastSavedAt": "2026-08-31T12:11:16.836Z",
+  "counts": {
+    "customers": 43,
+    "sites": 53,
+    "orders": 5,
+    "timeEntries": 21,
+    "archiveOrders": 4,
+    "bins": 37,
+    "binMovements": 39,
+    "dispoNotices": 2
+  }
+}
