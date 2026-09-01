@@ -1,0 +1,20 @@
+name: Show GitHub IDs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  show-ids:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show repository identity
+        run: |
+          echo "=========================================="
+          echo "ORGANISATION-ID: ${{ github.repository_owner_id }}"
+          echo "REPOSITORY-ID:   ${{ github.repository_id }}"
+          echo "REPOSITORY:      ${{ github.repository }}"
+          echo "BRANCH:          ${{ github.ref_name }}"
+          echo "=========================================="
