@@ -1,0 +1,69 @@
+name: Enable SharePoint Public CDN V2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  enable-cdn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Install Microsoft 365 CLI
+        run: npm install -g @pnp/cli-microsoft365
+
+      - name: Sign in as Microsoft 365 admin
+        run: |
+          echo "============================================================"
+          echo "GLEICH ERSCHEINT EIN MICROSOFT-GERAETECODE."
+          echo "Oeffne auf dem Tablet: https://microsoft.com/devicelogin"
+          echo "Gib dort den angezeigten Code ein und melde dich als Admin an."
+          echo "============================================================"
+          m365 login \
+            --authType deviceCode \
+            --appId 0fd312fc-63ab-4dcd-badc-8b6eff07b6ae \
+            --tenant ralphyourway.onmicrosoft.com
+
+      - name: Show current Public CDN status
+        run: |
+          echo "Public CDN Status VORHER:"
+          m365 spo cdn get --type Public --output text || true
+          echo ""
+          echo "Public CDN Urspruenge VORHER:"
+          m365 spo cdn origin list --type Public --output text || true
+
+      - name: Enable Public CDN
+        run: |
+          m365 spo cdn set --type Public --enabled true
+          echo "Public CDN wurde eingeschaltet."
+
+      - name: Ensure ClientSideAssets origin
+        run: |
+          ORIGINS="$(m365 spo cdn origin list --type Public --output text || true)"
+          echo "$ORIGINS"
+          if echo "$ORIGINS" | grep -Fq '*/CLIENTSIDEASSETS'; then
+            echo "CLIENTSIDEASSETS ist bereits als Public-CDN-Ursprung vorhanden."
+          else
+            echo "CLIENTSIDEASSETS fehlt noch - wird hinzugefuegt."
+            m365 spo cdn origin add --type Public --origin '*/CLIENTSIDEASSETS'
+          fi
+
+      - name: Verify Public CDN
+        run: |
+          echo "Public CDN Status NACHHER:"
+          m365 spo cdn get --type Public --output text
+          echo ""
+          echo "Public CDN Urspruenge NACHHER:"
+          m365 spo cdn origin list --type Public --output text
+
+      - name: Sign out
+        if: always()
+        run: m365 logout || true
