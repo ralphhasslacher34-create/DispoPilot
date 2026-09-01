@@ -1,0 +1,65 @@
+name: Enable SharePoint Public CDN V3 OIDC
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  enable-cdn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Install Microsoft 365 CLI
+        run: npm install -g @pnp/cli-microsoft365
+
+      - name: Sign in with GitHub OIDC
+        run: |
+          m365 login \
+            --authType federatedIdentity \
+            --appId 0fd312fc-63ab-4dcd-badc-8b6eff07b6ae \
+            --tenant 15149786-f1c5-4a9f-9db8-494865d515f5
+
+      - name: Show current Public CDN status
+        run: |
+          echo "Public CDN Status VORHER:"
+          m365 spo cdn get --type Public --output text || true
+          echo ""
+          echo "Public CDN Urspruenge VORHER:"
+          m365 spo cdn origin list --type Public --output text || true
+
+      - name: Enable Public CDN
+        run: |
+          m365 spo cdn set --type Public --enabled true
+          echo "Public CDN wurde eingeschaltet."
+
+      - name: Ensure ClientSideAssets origin
+        run: |
+          ORIGINS="$(m365 spo cdn origin list --type Public --output text || true)"
+          echo "$ORIGINS"
+          if echo "$ORIGINS" | grep -Fq '*/CLIENTSIDEASSETS'; then
+            echo "CLIENTSIDEASSETS ist bereits vorhanden."
+          else
+            echo "CLIENTSIDEASSETS fehlt - wird hinzugefuegt."
+            m365 spo cdn origin add --type Public --origin '*/CLIENTSIDEASSETS'
+          fi
+
+      - name: Verify Public CDN
+        run: |
+          echo "Public CDN Status NACHHER:"
+          m365 spo cdn get --type Public --output text
+          echo ""
+          echo "Public CDN Urspruenge NACHHER:"
+          m365 spo cdn origin list --type Public --output text
+
+      - name: Sign out
+        if: always()
+        run: m365 logout || true
