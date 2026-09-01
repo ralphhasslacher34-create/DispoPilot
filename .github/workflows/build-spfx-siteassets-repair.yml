@@ -118,8 +118,8 @@ jobs:
           test -n "$PKG"
           cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
 
-          test -d spfx-build/temp/deploy
-          cp -R spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          test -d spfx-build/release/assets 
+          cp -R spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
 
           test "$(find artifact/UPLOAD_TO_SITEASSETS -type f | wc -l)" -gt 0
           echo "=== Dateien fuer SiteAssets ==="
