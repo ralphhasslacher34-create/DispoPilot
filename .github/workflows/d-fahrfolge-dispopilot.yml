@@ -1,0 +1,347 @@
+name: D FAHRFOLGE DispoPilot V1.3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Check sources
+        run: |
+          test -f dispopilot-online-app.html
+          test -f prepare-spfx-final.py
+          test -f patch-dp-users-v2.py
+          python3 -m py_compile prepare-spfx-final.py
+          python3 -m py_compile patch-dp-users-v2.py
+
+      - name: Apply existing Bugfix E and F
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          src = Path("dispopilot-online-app.html")
+          out = Path("dispopilot-online-efd-base.html")
+          text = src.read_text(encoding="utf-8")
+          text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+          old_e = '<button class="btn secondary" type="button" onclick="renderOrders()">Aktualisieren</button>'
+          new_e = '<button class="btn secondary" type="button" onclick="window.location.reload()">Aktualisieren</button>'
+          if text.count(old_e) != 1:
+              raise SystemExit(f"E abgebrochen: Aktualisieren-Muster {text.count(old_e)}x gefunden statt 1x.")
+          text = text.replace(old_e, new_e, 1)
+
+          pattern_f = re.compile(
+              r"""const\s+baseCloseM\s*=\s*closeM\s*;\s*
+                  closeM\s*=\s*function\s*\(\s*id\s*\)\s*\{\s*
+                  baseCloseM\s*\(\s*id\s*\)\s*;\s*
+                  if\s*\(\s*id\s*===\s*['\"]detailModal['\"]\s*&&\s*dp13ReturnNoticeId\s*\)\s*\{\s*
+                  dp13ReturnNoticeId\s*=\s*null\s*;\s*
+                  setTimeout\s*\(\s*dp13CheckNotices\s*,\s*40\s*\)\s*
+                  \}\s*
+                  \}\s*;""",
+              re.VERBOSE
+          )
+
+          replacement_f = """const baseCloseM=closeM;
+          closeM=function(id){
+            baseCloseM(id);
+            if(id==='detailModal'&&dp13ReturnNoticeId){
+              const noticeId=dp13ReturnNoticeId;
+              dp13ReturnNoticeId=null;
+              const n=dp13NoticeList().find(x=>x.id===noticeId);
+              if(n&&!n.acknowledgedAt){
+                n.acknowledgedAt=nowIso();
+                persist().then(()=>setTimeout(dp13CheckNotices,40));
+              }else{
+                setTimeout(dp13CheckNotices,40);
+              }
+            }
+          };"""
+
+          text, count_f = pattern_f.subn(replacement_f, text, count=1)
+          if count_f != 1:
+              raise SystemExit(f"F abgebrochen: Meldungs-Schließen-Muster {count_f}x gefunden statt 1x.")
+
+          out.write_text(text, encoding="utf-8", newline="\n")
+          print("E und F wurden übernommen.")
+          PY
+
+          grep -q 'onclick="window.location.reload()">Aktualisieren</button>' dispopilot-online-efd-base.html
+          grep -q "const noticeId=dp13ReturnNoticeId" dispopilot-online-efd-base.html
+          grep -q "n.acknowledgedAt=nowIso()" dispopilot-online-efd-base.html
+
+      - name: Apply D Fahrfolge
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("dispopilot-online-efd-base.html")
+          text = path.read_text(encoding="utf-8")
+
+          marker = "/* DP13_PATCH_BEGIN */"
+          if text.count(marker) != 1:
+              raise SystemExit(f"D abgebrochen: DP13-Marker {text.count(marker)}x gefunden statt 1x.")
+
+          d_patch = r"""
+          /* DP_D_FAHRFOLGE_BEGIN */
+          function dpDSequencedGroup(date,driver,excludeId=null){
+            return state.orders
+              .filter(o=>o.date===date&&o.driver===driver&&o.seq&&o.id!==excludeId)
+              .sort((a,b)=>(Number(a.seq)||999)-(Number(b.seq)||999)||Number(a.id||0)-Number(b.id||0));
+          }
+
+          function dpDApplySequence(list){
+            let changed=false;
+            list.forEach((o,i)=>{
+              const seq=i+1;
+              if(Number(o.seq)!==seq){
+                o.seq=seq;
+                o.updatedAt=nowIso();
+                changed=true;
+              }
+            });
+            return changed;
+          }
+
+          function dpDNormalizeGroup(date,driver,excludeId=null){
+            if(!date||!driver)return false;
+            return dpDApplySequence(dpDSequencedGroup(date,driver,excludeId));
+          }
+
+          function dpDInsertAt(order,requestedSeq){
+            if(!order||!order.date||!order.driver||!requestedSeq)return false;
+            const others=dpDSequencedGroup(order.date,order.driver,order.id);
+            const pos=Math.max(1,Math.min(Number(requestedSeq)||1,others.length+1));
+            others.splice(pos-1,0,order);
+            return dpDApplySequence(others);
+          }
+
+          const dpDBaseSaveOrder=saveOrder;
+          saveOrder=async function(){
+            const editId=editingOrderId;
+            const before=editId&&orderById(editId)?JSON.parse(JSON.stringify(orderById(editId))):null;
+            const beforeIds=new Set(state.orders.map(o=>o.id));
+            const requestedSeq=$('oSeq').value?Number($('oSeq').value):0;
+
+            await dpDBaseSaveOrder();
+
+            const saved=editId?orderById(editId):state.orders.find(o=>!beforeIds.has(o.id));
+            if(!saved)return;
+
+            let changed=false;
+            const oldGroup=before&&before.date&&before.driver?before.date+'|||'+before.driver:'';
+            const newGroup=saved.date&&saved.driver?saved.date+'|||'+saved.driver:'';
+
+            if(before&&oldGroup&&(oldGroup!==newGroup||!requestedSeq)){
+              changed=dpDNormalizeGroup(before.date,before.driver,saved.id)||changed;
+            }
+
+            if(saved.driver&&saved.date&&requestedSeq){
+              changed=dpDInsertAt(saved,requestedSeq)||changed;
+            }else if(saved.driver&&saved.date){
+              changed=dpDNormalizeGroup(saved.date,saved.driver,saved.id)||changed;
+            }
+
+            if(changed)await persist();
+            renderAll();
+          };
+
+          moveOrder=async function(id,dir){
+            const o=orderById(id);
+            if(!o||!o.driver||!o.seq)return;
+
+            const group=dpDSequencedGroup(o.date,o.driver);
+            dpDApplySequence(group);
+
+            const i=group.findIndex(x=>x.id===id);
+            const j=i+dir;
+            if(i<0||j<0||j>=group.length)return;
+
+            const [moved]=group.splice(i,1);
+            group.splice(j,0,moved);
+            dpDApplySequence(group);
+
+            await persist();
+            renderPlanning();
+          };
+          /* DP_D_FAHRFOLGE_END */
+          """
+
+          text = text.replace(marker, d_patch + "\n" + marker, 1)
+          path.write_text(text, encoding="utf-8", newline="\n")
+          print("D Fahrfolge wurde eingefügt.")
+          PY
+
+          grep -q "DP_D_FAHRFOLGE_BEGIN" dispopilot-online-efd-base.html
+          grep -q "dpDInsertAt" dispopilot-online-efd-base.html
+          grep -q "dpDNormalizeGroup" dispopilot-online-efd-base.html
+          grep -q "moveOrder=async function" dispopilot-online-efd-base.html
+
+      - name: Apply DP Users authentication patch
+        run: |
+          python3 patch-dp-users-v2.py \
+            --input dispopilot-online-efd-base.html \
+            --output dispopilot-online-efd.html
+
+          grep -q "DISPOPILOT_DP_USERS_AUTH_V2" dispopilot-online-efd.html
+          grep -q "DP_Users" dispopilot-online-efd.html
+          grep -q "DP_D_FAHRFOLGE_BEGIN" dispopilot-online-efd.html
+          grep -q 'onclick="window.location.reload()">Aktualisieren</button>' dispopilot-online-efd.html
+          grep -q "n.acknowledgedAt=nowIso()" dispopilot-online-efd.html
+
+      - name: Install SPFx CLI
+        run: npm install -g @microsoft/spfx-cli@latest
+
+      - name: Scaffold SPFx web part
+        run: |
+          rm -rf spfx-build
+          spfx create \
+            --template webpart-noframework \
+            --library-name dispopilot-online-v13 \
+            --component-name "DispoPilot Online" \
+            --component-alias DispoPilotOnline \
+            --component-description "DispoPilot Online V1.3" \
+            --solution-name dispopilot-online-v13 \
+            --target-dir spfx-build \
+            --package-manager npm
+
+      - name: Insert patched runtime
+        run: |
+          python3 prepare-spfx-final.py \
+            --app dispopilot-online-efd.html \
+            --project spfx-build
+
+      - name: Configure SiteAssets hosting
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          package = Path('spfx-build/config/package-solution.json')
+          pdata = json.loads(package.read_text(encoding='utf-8'))
+          solution = pdata['solution']
+          solution['version'] = '1.3.5.3'
+          solution['includeClientSideAssets'] = False
+          solution['skipFeatureDeployment'] = True
+          package.write_text(json.dumps(pdata, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+          wm_path = Path('spfx-build/config/write-manifests.json')
+          wm = {
+            '$schema': 'https://developer.microsoft.com/json-schemas/spfx-build/write-manifests.schema.json',
+            'cdnBasePath': 'https://ralphyourway.sharepoint.com/sites/DispoPilot/SiteAssets/DispoPilotAssets'
+          }
+          wm_path.write_text(json.dumps(wm, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+          manifests = list(Path('spfx-build/src/webparts').rglob('*.manifest.json'))
+          if not manifests:
+              raise SystemExit('Kein Webpart-Manifest gefunden.')
+
+          for manifest in manifests:
+              data = json.loads(manifest.read_text(encoding='utf-8'))
+              hosts = data.setdefault('supportedHosts', [])
+              for host in ('SharePointWebPart', 'SharePointFullPage'):
+                  if host not in hosts:
+                      hosts.append(host)
+              manifest.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          PY
+
+      - name: Verify configuration
+        run: |
+          grep -q '"includeClientSideAssets": false' spfx-build/config/package-solution.json
+          grep -q '"version": "1.3.5.3"' spfx-build/config/package-solution.json
+          grep -q 'SiteAssets/DispoPilotAssets' spfx-build/config/write-manifests.json
+          grep -R '"SharePointFullPage"' spfx-build/src/webparts
+          grep -R 'DP_Users' spfx-build/src/webparts
+          grep -R 'DP_D_FAHRFOLGE_BEGIN' spfx-build/src/webparts
+          grep -R 'window.location.reload()' spfx-build/src/webparts
+          grep -R 'n.acknowledgedAt=nowIso()' spfx-build/src/webparts
+
+      - name: Build production bundle
+        working-directory: spfx-build
+        run: npx heft build --production
+
+      - name: Package SharePoint solution
+        working-directory: spfx-build
+        run: npx heft package-solution --production
+
+      - name: Collect SiteAssets and package
+        run: |
+          set -e
+          rm -rf artifact
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS
+          mkdir -p artifact/UPLOAD_TO_APP_CATALOG
+
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n 1)
+          test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          if [ -d "spfx-build/release/assets" ]; then
+            cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d "spfx-build/temp/deploy" ]; then
+            cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else
+            echo "Keine SPFx Asset-Ausgabe gefunden."
+            exit 1
+          fi
+
+          test "$(find artifact/UPLOAD_TO_SITEASSETS -type f | wc -l)" -gt 0
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+DispoPilot V1.3 - D Fahrfolge - Paketrevision 1.3.5.3
+
+Dieser Build behält die bereits getesteten Bugfixes E und F bei
+und ergänzt nur Punkt D.
+
+D - Fahrfolge:
+- Pro Fahrer und Tag ist jede Fahrfolgenummer eindeutig.
+- Wird z. B. Position 2 vergeben, rücken bisherige Positionen
+  2, 3, 4 usw. automatisch nach hinten.
+- Nach Einfügen/Verschieben wird die Fahrfolge lückenlos
+  1, 2, 3 ... aufgebaut.
+- Aufträge ohne Fahrfolge bleiben bewusst ohne Fahrfolge.
+- Derselbe Zahlenwert darf bei verschiedenen Fahrern bzw.
+  an verschiedenen Tagen vorkommen.
+
+DEPLOYMENT:
+1. Alle Dateien aus UPLOAD_TO_SITEASSETS nach
+   /sites/DispoPilot/SiteAssets/DispoPilotAssets
+   hochladen.
+2. Danach die SPPKG aus UPLOAD_TO_APP_CATALOG
+   im App-Katalog ersetzen und aktivieren.
+3. DispoPilot neu laden.
+
+TEST D:
+- Für einen Fahrer drei Aufträge mit 1, 2, 3 anlegen.
+- Einen neuen Auftrag auf Position 2 einfügen.
+- Erwartet: 1, 2(neu), 3, 4.
+- Bestehenden Auftrag von Position 4 auf 2 setzen.
+- Erwartet: wieder eindeutig und lückenlos 1, 2, 3, 4.
+- Pfeile hoch/runter testen.
+- Zweiten Fahrer später separat prüfen: Er darf unabhängig
+  ebenfalls Position 1, 2, 3 ... haben.
+
+Unverändert:
+A - mehrere Mulden
+B - Muldeninhalt
+C - Rollen/Ansichten
+E/F - bleiben erhalten
+G - automatische Hintergrundaktualisierung noch nicht enthalten
+TXT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: D-FAHRFOLGE-DISPOPILOT
+          path: artifact/
+          if-no-files-found: error
