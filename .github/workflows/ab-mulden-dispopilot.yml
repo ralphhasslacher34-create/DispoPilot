@@ -1,0 +1,570 @@
+name: AB MULDEN DispoPilot V1.3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Check sources
+        run: |
+          test -f dispopilot-online-app.html
+          test -f prepare-spfx-final.py
+          test -f patch-dp-users-v2.py
+          python3 -m py_compile prepare-spfx-final.py
+          python3 -m py_compile patch-dp-users-v2.py
+
+      - name: Apply existing Bugfix E and F
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          src = Path("dispopilot-online-app.html")
+          out = Path("dispopilot-online-efd-base.html")
+          text = src.read_text(encoding="utf-8")
+          text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+          old_e = '<button class="btn secondary" type="button" onclick="renderOrders()">Aktualisieren</button>'
+          new_e = '<button class="btn secondary" type="button" onclick="window.location.reload()">Aktualisieren</button>'
+          if text.count(old_e) != 1:
+              raise SystemExit(f"E abgebrochen: Aktualisieren-Muster {text.count(old_e)}x gefunden statt 1x.")
+          text = text.replace(old_e, new_e, 1)
+
+          pattern_f = re.compile(
+              r"""const\s+baseCloseM\s*=\s*closeM\s*;\s*
+                  closeM\s*=\s*function\s*\(\s*id\s*\)\s*\{\s*
+                  baseCloseM\s*\(\s*id\s*\)\s*;\s*
+                  if\s*\(\s*id\s*===\s*['\"]detailModal['\"]\s*&&\s*dp13ReturnNoticeId\s*\)\s*\{\s*
+                  dp13ReturnNoticeId\s*=\s*null\s*;\s*
+                  setTimeout\s*\(\s*dp13CheckNotices\s*,\s*40\s*\)\s*
+                  \}\s*
+                  \}\s*;""",
+              re.VERBOSE
+          )
+
+          replacement_f = """const baseCloseM=closeM;
+          closeM=function(id){
+            baseCloseM(id);
+            if(id==='detailModal'&&dp13ReturnNoticeId){
+              const noticeId=dp13ReturnNoticeId;
+              dp13ReturnNoticeId=null;
+              const n=dp13NoticeList().find(x=>x.id===noticeId);
+              if(n&&!n.acknowledgedAt){
+                n.acknowledgedAt=nowIso();
+                persist().then(()=>setTimeout(dp13CheckNotices,40));
+              }else{
+                setTimeout(dp13CheckNotices,40);
+              }
+            }
+          };"""
+
+          text, count_f = pattern_f.subn(replacement_f, text, count=1)
+          if count_f != 1:
+              raise SystemExit(f"F abgebrochen: Meldungs-Schließen-Muster {count_f}x gefunden statt 1x.")
+
+          out.write_text(text, encoding="utf-8", newline="\n")
+          print("E und F wurden übernommen.")
+          PY
+
+          grep -q 'onclick="window.location.reload()">Aktualisieren</button>' dispopilot-online-efd-base.html
+          grep -q "const noticeId=dp13ReturnNoticeId" dispopilot-online-efd-base.html
+          grep -q "n.acknowledgedAt=nowIso()" dispopilot-online-efd-base.html
+
+      - name: Apply D Fahrfolge
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("dispopilot-online-efd-base.html")
+          text = path.read_text(encoding="utf-8")
+
+          marker = "/* DP13_PATCH_BEGIN */"
+          if text.count(marker) != 1:
+              raise SystemExit(f"D abgebrochen: DP13-Marker {text.count(marker)}x gefunden statt 1x.")
+
+          d_patch = r"""
+          /* DP_D_FAHRFOLGE_BEGIN */
+          function dpDSequencedGroup(date,driver,excludeId=null){
+            return state.orders
+              .filter(o=>o.date===date&&o.driver===driver&&o.seq&&o.id!==excludeId)
+              .sort((a,b)=>(Number(a.seq)||999)-(Number(b.seq)||999)||Number(a.id||0)-Number(b.id||0));
+          }
+
+          function dpDApplySequence(list){
+            let changed=false;
+            list.forEach((o,i)=>{
+              const seq=i+1;
+              if(Number(o.seq)!==seq){
+                o.seq=seq;
+                o.updatedAt=nowIso();
+                changed=true;
+              }
+            });
+            return changed;
+          }
+
+          function dpDNormalizeGroup(date,driver,excludeId=null){
+            if(!date||!driver)return false;
+            return dpDApplySequence(dpDSequencedGroup(date,driver,excludeId));
+          }
+
+          function dpDInsertAt(order,requestedSeq){
+            if(!order||!order.date||!order.driver||!requestedSeq)return false;
+            const others=dpDSequencedGroup(order.date,order.driver,order.id);
+            const pos=Math.max(1,Math.min(Number(requestedSeq)||1,others.length+1));
+            others.splice(pos-1,0,order);
+            return dpDApplySequence(others);
+          }
+
+          const dpDBaseSaveOrder=saveOrder;
+          saveOrder=async function(){
+            const editId=editingOrderId;
+            const before=editId&&orderById(editId)?JSON.parse(JSON.stringify(orderById(editId))):null;
+            const beforeIds=new Set(state.orders.map(o=>o.id));
+            const requestedSeq=$('oSeq').value?Number($('oSeq').value):0;
+
+            await dpDBaseSaveOrder();
+
+            const saved=editId?orderById(editId):state.orders.find(o=>!beforeIds.has(o.id));
+            if(!saved)return;
+
+            let changed=false;
+            const oldGroup=before&&before.date&&before.driver?before.date+'|||'+before.driver:'';
+            const newGroup=saved.date&&saved.driver?saved.date+'|||'+saved.driver:'';
+
+            if(before&&oldGroup&&(oldGroup!==newGroup||!requestedSeq)){
+              changed=dpDNormalizeGroup(before.date,before.driver,saved.id)||changed;
+            }
+
+            if(saved.driver&&saved.date&&requestedSeq){
+              changed=dpDInsertAt(saved,requestedSeq)||changed;
+            }else if(saved.driver&&saved.date){
+              changed=dpDNormalizeGroup(saved.date,saved.driver,saved.id)||changed;
+            }
+
+            if(changed)await persist();
+            renderAll();
+          };
+
+          moveOrder=async function(id,dir){
+            const o=orderById(id);
+            if(!o||!o.driver||!o.seq)return;
+
+            const group=dpDSequencedGroup(o.date,o.driver);
+            dpDApplySequence(group);
+
+            const i=group.findIndex(x=>x.id===id);
+            const j=i+dir;
+            if(i<0||j<0||j>=group.length)return;
+
+            const [moved]=group.splice(i,1);
+            group.splice(j,0,moved);
+            dpDApplySequence(group);
+
+            await persist();
+            renderPlanning();
+          };
+          /* DP_D_FAHRFOLGE_END */
+          """
+
+          text = text.replace(marker, d_patch + "\n" + marker, 1)
+          path.write_text(text, encoding="utf-8", newline="\n")
+          print("D Fahrfolge wurde eingefügt.")
+          PY
+
+          grep -q "DP_D_FAHRFOLGE_BEGIN" dispopilot-online-efd-base.html
+          grep -q "dpDInsertAt" dispopilot-online-efd-base.html
+          grep -q "dpDNormalizeGroup" dispopilot-online-efd-base.html
+          grep -q "moveOrder=async function" dispopilot-online-efd-base.html
+
+      - name: Apply A multiple bins and B disposal logic
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("dispopilot-online-efd-base.html")
+          text = path.read_text(encoding="utf-8")
+
+          # A1: Anzahl Mulden von 1..3 auf 1..10 erweitern.
+          old_count = '<div><label>Anzahl Mulden</label><select id="oCount" onchange="binCountChanged()"><option>1</option><option>2</option><option>3</option></select></div>'
+          new_count = '<div><label>Anzahl Mulden</label><select id="oCount" onchange="binCountChanged()">' + ''.join(f'<option>{i}</option>' for i in range(1,11)) + '</select></div>'
+          if text.count(old_count) != 1:
+              raise SystemExit(f"A abgebrochen: Anzahl-Mulden-Feld {text.count(old_count)}x gefunden statt 1x.")
+          text = text.replace(old_count, new_count, 1)
+
+          # A2: Dynamische Muldennummern unter den vorhandenen Typfeldern.
+          anchor_numbers = '<div><label>Muldentyp 1</label><select id="oBin1"></select></div><div id="bin2Field"><label>Muldentyp 2</label><select id="oBin2"></select></div><div id="bin3Field"><label>Muldentyp 3</label><select id="oBin3"></select></div>'
+          replacement_numbers = anchor_numbers + '<div id="dpABBinNumberFields" style="grid-column:1/-1"></div>'
+          if text.count(anchor_numbers) != 1:
+              raise SystemExit(f"A abgebrochen: Mulden-Typblock {text.count(anchor_numbers)}x gefunden statt 1x.")
+          text = text.replace(anchor_numbers, replacement_numbers, 1)
+
+          # B1: Bei der Ausführung muss ausdrücklich bestätigt werden,
+          # ob tatsächlich entleert/entsorgt wurde.
+          anchor_disposal = '<div style="margin-top:12px"><label>Bemerkung</label><textarea id="statusNote"></textarea></div><button class="btn primary full" style="margin-top:14px" type="button" onclick="confirmStatus()">Status speichern</button>'
+          replacement_disposal = '<div style="margin-top:12px"><label>Bemerkung</label><textarea id="statusNote"></textarea></div><div class="switchline" style="margin-top:12px"><input id="statusDisposed" type="checkbox"><label for="statusDisposed" style="margin:0"><strong>Inhalt tatsächlich entleert / entsorgt</strong></label></div><div class="small" style="margin-top:5px">Nur aktivieren, wenn der Muldeninhalt wirklich abgeladen bzw. entsorgt wurde.</div><button class="btn primary full" style="margin-top:14px" type="button" onclick="confirmStatus()">Status speichern</button>'
+          if text.count(anchor_disposal) != 1:
+              raise SystemExit(f"B abgebrochen: Status-Bemerkungsblock {text.count(anchor_disposal)}x gefunden statt 1x.")
+          text = text.replace(anchor_disposal, replacement_disposal, 1)
+
+          marker = "/* DP13_PATCH_BEGIN */"
+          if text.count(marker) != 1:
+              raise SystemExit(f"AB abgebrochen: DP13-Marker {text.count(marker)}x gefunden statt 1x.")
+
+          patch = r"""
+          /* DP_AB_MULDEN_BEGIN */
+          function dpABNumbersFromOrder(o){
+            if(!o)return [];
+            return parsedBinNumbers(o.binNumbers||'').slice(0,10);
+          }
+
+          function dpABTypeForIndex(o,i){
+            if(o&&Array.isArray(o.binTypes)&&o.binTypes[i])return o.binTypes[i];
+            return [o?.bin1,o?.bin2,o?.bin3][i]||o?.bin1||'';
+          }
+
+          function dpABCollectNumbers(){
+            const n=Math.max(1,Math.min(10,Number($('oCount')?.value||1)));
+            const out=[];
+            for(let i=1;i<=n;i++){
+              const el=$('oBinNumber'+i);
+              out.push(el?el.value.trim():'');
+            }
+            return out;
+          }
+
+          function dpABCollectTypes(){
+            const n=Math.max(1,Math.min(10,Number($('oCount')?.value||1)));
+            const out=[];
+            for(let i=1;i<=n;i++){
+              if(i===1)out.push($('oBin1')?.value||'');
+              else if(i===2)out.push($('oBin2')?.value||'');
+              else if(i===3)out.push($('oBin3')?.value||'');
+              else out.push($('oBinType'+i)?.value||$('oBin1')?.value||'');
+            }
+            return out;
+          }
+
+          function dpABRenderBinFields(order=null,forceOrder=false){
+            const host=$('dpABBinNumberFields');
+            if(!host)return;
+            const n=Math.max(1,Math.min(10,Number($('oCount')?.value||1)));
+            const current={};
+            for(let i=1;i<=10;i++){
+              const el=$('oBinNumber'+i);
+              if(el)current[i]=el.value;
+            }
+            const planned=dpABNumbersFromOrder(order);
+            let html='<div class="section" style="margin-top:4px">Muldennummern</div><div class="miniGrid">';
+            for(let i=1;i<=n;i++){
+              const val=forceOrder?(planned[i-1]||''):(current[i]||planned[i-1]||'');
+              html+='<div><label>Muldennummer '+i+'</label><input id="oBinNumber'+i+'" inputmode="numeric" value="'+esc(val)+'" placeholder="Nummer '+i+'"></div>';
+              if(i>3){
+                const selected=dpABTypeForIndex(order,i-1);
+                html+='<div><label>Muldentyp '+i+'</label><select id="oBinType'+i+'">'+BIN_TYPES.map(x=>'<option '+(x===selected?'selected':'')+'>'+esc(x)+'</option>').join('')+'</select></div>';
+              }
+            }
+            html+='</div>';
+            host.innerHTML=html;
+          }
+
+          const dpABBaseBinCountChanged=binCountChanged;
+          binCountChanged=function(){
+            dpABBaseBinCountChanged();
+            dpABRenderBinFields(editingOrderId?orderById(editingOrderId):null,false);
+          };
+
+          const dpABBaseEditOrder=editOrder;
+          editOrder=function(id=null){
+            dpABBaseEditOrder(id);
+            dpABRenderBinFields(id?orderById(id):null,true);
+          };
+
+          const dpABBaseSaveOrder=saveOrder;
+          saveOrder=async function(){
+            const editId=editingOrderId;
+            const beforeIds=new Set(state.orders.map(o=>o.id));
+            const numbers=dpABCollectNumbers();
+            const types=dpABCollectTypes();
+            await dpABBaseSaveOrder();
+            const saved=editId?orderById(editId):state.orders.find(o=>!beforeIds.has(o.id));
+            if(!saved)return;
+            saved.count=Math.max(1,Math.min(10,Number(saved.count||numbers.length||1)));
+            saved.binNumbers=numbers.filter(Boolean).join(', ');
+            saved.binTypes=types.slice(0,saved.count);
+            if(saved.binTypes[0])saved.bin1=saved.binTypes[0];
+            if(saved.count>1&&saved.binTypes[1])saved.bin2=saved.binTypes[1];else if(saved.count<2)saved.bin2='';
+            if(saved.count>2&&saved.binTypes[2])saved.bin3=saved.binTypes[2];else if(saved.count<3)saved.bin3='';
+            saved.updatedAt=nowIso();
+            await persist();
+            renderAll();
+          };
+
+          orderBinType=function(o,i){
+            if(o&&Array.isArray(o.binTypes)&&o.binTypes[i])return o.binTypes[i];
+            return [o?.bin1,o?.bin2,o?.bin3][i]||o?.bin1||'';
+          };
+
+          confirmedNumbers=function(o,preferred=''){
+            const fromOrder=parsedBinNumbers(o?.binNumbers||'');
+            if(fromOrder.length)return fromOrder.slice(0,10);
+            const p=String(preferred||'').trim();
+            return p?[p]:[];
+          };
+
+          const dpABBaseSetStatus=setStatus;
+          setStatus=function(s){
+            dpABBaseSetStatus(s);
+            const o=orderById(currentOrderId);
+            if($('statusDisposed'))$('statusDisposed').checked=!!o?.disposed;
+          };
+
+          const dpABBaseConfirmStatus=confirmStatus;
+          confirmStatus=async function(){
+            const o=orderById(currentOrderId);
+            if(o)o.disposed=!!$('statusDisposed')?.checked;
+            await dpABBaseConfirmStatus();
+          };
+
+          applyBinMovement=function(o){
+            const c=customer(o.customerId),st=site(o.siteId),loc=`${c?.name||''} / ${st?.name||''}`;
+            const materialAfter=(b)=>o.disposed?'':(o.material||b.material||'');
+
+            if(['Stellen','Liefern'].includes(o.task)){
+              const nums=confirmedNumbers(o,o.newBinNumber);
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId,material:o.material||b.material});
+                addMovement(b,o,o.task,from,loc);
+              });
+            }else if(o.task==='Abholen'){
+              const nums=confirmedNumbers(o,o.existingBinNumber);
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Auf Lager',customerId:null,siteId:null,material:materialAfter(b)});
+                addMovement(b,o,'Abholen',from,'Auf Lager');
+              });
+            }else if(o.task==='Tauschen'){
+              const old=String(o.existingBinNumber||'').trim()||parsedBinNumbers(o.binNumbers)[0]||'';
+              const neu=String(o.newBinNumber||'').trim();
+              if(old){
+                const b=ensureBin(old,o.bin1),from=locationText(b);
+                Object.assign(b,{status:'Auf Lager',customerId:null,siteId:null,material:materialAfter(b)});
+                addMovement(b,o,'Tauschen – abgeholt',from,'Auf Lager');
+              }
+              if(neu){
+                const b=ensureBin(neu,o.bin1),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId,material:''});
+                addMovement(b,o,'Tauschen – gestellt',from,loc);
+              }
+            }else if(o.task==='Leeren'){
+              const nums=confirmedNumbers(o,o.existingBinNumber);
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId,material:materialAfter(b)});
+                addMovement(b,o,'Leeren',from,loc);
+              });
+            }else if(o.task==='Umstellen'){
+              const nums=confirmedNumbers(o,o.existingBinNumber);
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId});
+                addMovement(b,o,'Umstellen',from,loc);
+              });
+            }else if(o.task==='Transportieren'){
+              const nums=confirmedNumbers(o);
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,orderBinType(o,i)),from=locationText(b);
+                if(o.disposed)b.material='';
+                addMovement(b,o,'Transportieren',from,locationText(b));
+              });
+            }
+          };
+          /* DP_AB_MULDEN_END */
+          """
+
+          text = text.replace(marker, patch + "\n" + marker, 1)
+          path.write_text(text, encoding="utf-8", newline="\n")
+          print("A und B wurden eingefügt.")
+          PY
+
+          grep -q "DP_AB_MULDEN_BEGIN" dispopilot-online-efd-base.html
+          grep -q "<option>10</option>" dispopilot-online-efd-base.html
+          grep -q "dpABBinNumberFields" dispopilot-online-efd-base.html
+          grep -q "statusDisposed" dispopilot-online-efd-base.html
+          grep -q "materialAfter" dispopilot-online-efd-base.html
+
+      - name: Apply DP Users authentication patch
+        run: |
+          python3 patch-dp-users-v2.py \
+            --input dispopilot-online-efd-base.html \
+            --output dispopilot-online-efd.html
+
+          grep -q "DISPOPILOT_DP_USERS_AUTH_V2" dispopilot-online-efd.html
+          grep -q "DP_Users" dispopilot-online-efd.html
+          grep -q "DP_D_FAHRFOLGE_BEGIN" dispopilot-online-efd.html
+          grep -q 'onclick="window.location.reload()">Aktualisieren</button>' dispopilot-online-efd.html
+          grep -q "n.acknowledgedAt=nowIso()" dispopilot-online-efd.html
+
+      - name: Install SPFx CLI
+        run: npm install -g @microsoft/spfx-cli@latest
+
+      - name: Scaffold SPFx web part
+        run: |
+          rm -rf spfx-build
+          spfx create \
+            --template webpart-noframework \
+            --library-name dispopilot-online-v13 \
+            --component-name "DispoPilot Online" \
+            --component-alias DispoPilotOnline \
+            --component-description "DispoPilot Online V1.3" \
+            --solution-name dispopilot-online-v13 \
+            --target-dir spfx-build \
+            --package-manager npm
+
+      - name: Insert patched runtime
+        run: |
+          python3 prepare-spfx-final.py \
+            --app dispopilot-online-efd.html \
+            --project spfx-build
+
+      - name: Configure SiteAssets hosting
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          package = Path('spfx-build/config/package-solution.json')
+          pdata = json.loads(package.read_text(encoding='utf-8'))
+          solution = pdata['solution']
+          solution['version'] = '1.3.5.4'
+          solution['includeClientSideAssets'] = False
+          solution['skipFeatureDeployment'] = True
+          package.write_text(json.dumps(pdata, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+          wm_path = Path('spfx-build/config/write-manifests.json')
+          wm = {
+            '$schema': 'https://developer.microsoft.com/json-schemas/spfx-build/write-manifests.schema.json',
+            'cdnBasePath': 'https://ralphyourway.sharepoint.com/sites/DispoPilot/SiteAssets/DispoPilotAssets'
+          }
+          wm_path.write_text(json.dumps(wm, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+          manifests = list(Path('spfx-build/src/webparts').rglob('*.manifest.json'))
+          if not manifests:
+              raise SystemExit('Kein Webpart-Manifest gefunden.')
+
+          for manifest in manifests:
+              data = json.loads(manifest.read_text(encoding='utf-8'))
+              hosts = data.setdefault('supportedHosts', [])
+              for host in ('SharePointWebPart', 'SharePointFullPage'):
+                  if host not in hosts:
+                      hosts.append(host)
+              manifest.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          PY
+
+      - name: Verify configuration
+        run: |
+          grep -q '"includeClientSideAssets": false' spfx-build/config/package-solution.json
+          grep -q '"version": "1.3.5.4"' spfx-build/config/package-solution.json
+          grep -q 'SiteAssets/DispoPilotAssets' spfx-build/config/write-manifests.json
+          grep -R '"SharePointFullPage"' spfx-build/src/webparts
+          grep -R 'DP_Users' spfx-build/src/webparts
+          grep -R 'DP_D_FAHRFOLGE_BEGIN' spfx-build/src/webparts
+          grep -R 'window.location.reload()' spfx-build/src/webparts
+          grep -R 'n.acknowledgedAt=nowIso()' spfx-build/src/webparts
+
+      - name: Build production bundle
+        working-directory: spfx-build
+        run: npx heft build --production
+
+      - name: Package SharePoint solution
+        working-directory: spfx-build
+        run: npx heft package-solution --production
+
+      - name: Collect SiteAssets and package
+        run: |
+          set -e
+          rm -rf artifact
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS
+          mkdir -p artifact/UPLOAD_TO_APP_CATALOG
+
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n 1)
+          test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          if [ -d "spfx-build/release/assets" ]; then
+            cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d "spfx-build/temp/deploy" ]; then
+            cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else
+            echo "Keine SPFx Asset-Ausgabe gefunden."
+            exit 1
+          fi
+
+          test "$(find artifact/UPLOAD_TO_SITEASSETS -type f | wc -l)" -gt 0
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DispoPilot V1.3 - A/B Mulden - Paketrevision 1.3.5.4
+
+          Dieser Build behaelt die bereits getesteten Punkte D, E und F bei
+          und ergaenzt A und B.
+
+          A - Mehrere Mulden:
+          - Anzahl Mulden 1 bis 10.
+          - Entsprechend 1 bis 10 Eingabefelder fuer Muldennummern.
+          - Fuer Mulde 4 bis 10 werden zusaetzlich Typfelder erzeugt.
+          - Die Nummern werden im Auftrag gespeichert und beim Fahrerabschluss
+            wieder als Muldennummern vorgeschlagen.
+
+          B - Inhaltsstatus:
+          - Beim Abschluss gibt es die ausdrueckliche Auswahl
+            "Inhalt tatsaechlich entleert / entsorgt".
+          - Nur wenn diese Auswahl gesetzt ist, wird der Inhalt der bewegten
+            Mulde auf leer gesetzt.
+          - Abholen, Tauschen, Transportieren oder Umstellen ohne Entleerung
+            loeschen den vorhandenen Inhalt nicht.
+          - Die Bestandsaenderung erfolgt weiterhin erst bei Ausgefuehrt.
+
+          DEPLOYMENT:
+          1. Alle Dateien aus UPLOAD_TO_SITEASSETS nach
+             /sites/DispoPilot/SiteAssets/DispoPilotAssets hochladen.
+          2. Danach die SPPKG aus UPLOAD_TO_APP_CATALOG im App-Katalog
+             ersetzen und aktivieren.
+          3. DispoPilot neu laden.
+
+          TEST A:
+          - Auftrag mit 4 Mulden waehlen -> 4 Nummernfelder muessen erscheinen.
+          - Auftrag mit 10 Mulden waehlen -> 10 Nummernfelder muessen erscheinen.
+          - Nummern speichern, Auftrag erneut oeffnen und kontrollieren.
+
+          TEST B:
+          - Mulde mit bekanntem Inhalt anlegen/verwenden.
+          - Abholen oder Transportieren OHNE Haken "entleert/entsorgt":
+            Inhalt muss erhalten bleiben.
+          - Leeren bzw. Vorgang MIT Haken:
+            Inhalt muss nach Ausgefuehrt leer sein.
+
+          Unveraendert:
+          C - Rollen/Ansichten
+          D - Fahrfolge bleibt erhalten
+          E/F - bleiben erhalten
+          G - automatische Hintergrundaktualisierung noch nicht enthalten
+          TXT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AB-MULDEN-DISPOPILOT
+          path: artifact/
+          if-no-files-found: error
