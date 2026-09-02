@@ -1,0 +1,248 @@
+name: Build DispoPilot V1.3 Bugfix E-F
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Check existing DispoPilot sources
+        run: |
+          test -f dispopilot-online-app.html
+          test -f prepare-spfx-final.py
+          test -f patch-dp-users-v2.py
+          python3 -m py_compile prepare-spfx-final.py
+          python3 -m py_compile patch-dp-users-v2.py
+          grep -q "DispoPilot SPFx FINAL JSONC v1" prepare-spfx-final.py
+          grep -q "DISPOPILOT_DP_USERS_AUTH_V2" patch-dp-users-v2.py
+
+      - name: Create authenticated app source
+        run: |
+          python3 patch-dp-users-v2.py \
+            --input dispopilot-online-app.html \
+            --output dispopilot-online-siteassets.html
+          grep -q "DISPOPILOT_DP_USERS_AUTH_V2" dispopilot-online-siteassets.html
+          grep -q "DP_Users" dispopilot-online-siteassets.html
+
+      - name: Apply Bugfix E and F only
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          src = Path("dispopilot-online-siteassets.html")
+          out = Path("dispopilot-online-ef.html")
+          text = src.read_text(encoding="utf-8")
+
+          old_e = '<button class="btn secondary" type="button" onclick="renderOrders()">Aktualisieren</button>'
+          new_e = '<button class="btn secondary" type="button" onclick="window.location.reload()">Aktualisieren</button>'
+
+          if text.count(old_e) != 1:
+              raise SystemExit(
+                  f"Bugfix E aborted: expected refresh-button pattern exactly once, found {text.count(old_e)}."
+              )
+          text = text.replace(old_e, new_e, 1)
+
+          old_f = """  const baseCloseM=closeM;
+          closeM=function(id){baseCloseM(id);if(id==='detailModal'&&dp13ReturnNoticeId){dp13ReturnNoticeId=null;setTimeout(dp13CheckNotices,40)}};"""
+
+          new_f = """  const baseCloseM=closeM;
+          closeM=function(id){
+            baseCloseM(id);
+            if(id==='detailModal'&&dp13ReturnNoticeId){
+              const noticeId=dp13ReturnNoticeId;
+              dp13ReturnNoticeId=null;
+              const n=dp13NoticeList().find(x=>x.id===noticeId);
+              if(n&&!n.acknowledgedAt){
+                n.acknowledgedAt=nowIso();
+                persist().then(()=>setTimeout(dp13CheckNotices,40));
+              }else{
+                setTimeout(dp13CheckNotices,40);
+              }
+            }
+          };"""
+
+          if text.count(old_f) != 1:
+              raise SystemExit(
+                  f"Bugfix F aborted: expected notice-close pattern exactly once, found {text.count(old_f)}."
+              )
+          text = text.replace(old_f, new_f, 1)
+
+          out.write_text(text, encoding="utf-8")
+          print("Bugfix E applied: Aktualisieren reloads central SharePoint state.")
+          print("Bugfix F applied: closing viewed notice order acknowledges the notice.")
+          PY
+
+          grep -q 'onclick="window.location.reload()">Aktualisieren</button>' dispopilot-online-ef.html
+          grep -q "const noticeId=dp13ReturnNoticeId" dispopilot-online-ef.html
+          grep -q "n.acknowledgedAt=nowIso()" dispopilot-online-ef.html
+          grep -q "DISPOPILOT_DP_USERS_AUTH_V2" dispopilot-online-ef.html
+          grep -q "DP_Users" dispopilot-online-ef.html
+
+      - name: Install SPFx CLI
+        run: npm install -g @microsoft/spfx-cli@latest
+
+      - name: Scaffold SPFx web part
+        run: |
+          rm -rf spfx-build
+          spfx create \
+            --template webpart-noframework \
+            --library-name dispopilot-online-v13 \
+            --component-name "DispoPilot Online" \
+            --component-alias DispoPilotOnline \
+            --component-description "DispoPilot Online V1.3" \
+            --solution-name dispopilot-online-v13 \
+            --target-dir spfx-build \
+            --package-manager npm
+
+      - name: Insert Bugfix E-F runtime
+        run: |
+          python3 prepare-spfx-final.py \
+            --app dispopilot-online-ef.html \
+            --project spfx-build
+
+      - name: Configure SiteAssets hosting
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          package = Path('spfx-build/config/package-solution.json')
+          pdata = json.loads(package.read_text(encoding='utf-8'))
+          solution = pdata['solution']
+          solution['version'] = '1.3.5.2'
+          solution['includeClientSideAssets'] = False
+          solution['skipFeatureDeployment'] = True
+          package.write_text(
+              json.dumps(pdata, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8'
+          )
+
+          write_manifests = Path('spfx-build/config/write-manifests.json')
+          wm = {
+            '$schema': 'https://developer.microsoft.com/json-schemas/spfx-build/write-manifests.schema.json',
+            'cdnBasePath': 'https://ralphyourway.sharepoint.com/sites/DispoPilot/SiteAssets/DispoPilotAssets'
+          }
+          write_manifests.write_text(
+              json.dumps(wm, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8'
+          )
+
+          manifests = list(Path('spfx-build/src/webparts').rglob('*.manifest.json'))
+          if not manifests:
+              raise SystemExit('Kein Webpart-Manifest gefunden.')
+
+          for manifest in manifests:
+              data = json.loads(manifest.read_text(encoding='utf-8'))
+              hosts = data.setdefault('supportedHosts', [])
+              for host in ('SharePointWebPart', 'SharePointFullPage'):
+                  if host not in hosts:
+                      hosts.append(host)
+              manifest.write_text(
+                  json.dumps(data, ensure_ascii=False, indent=2) + '\n',
+                  encoding='utf-8'
+              )
+
+          print('SiteAssets URL:', wm['cdnBasePath'])
+          print('includeClientSideAssets:', solution['includeClientSideAssets'])
+          print('technical package revision:', solution['version'])
+          PY
+
+      - name: Verify build configuration
+        run: |
+          grep -q '"includeClientSideAssets": false' spfx-build/config/package-solution.json
+          grep -q '"version": "1.3.5.2"' spfx-build/config/package-solution.json
+          grep -q 'SiteAssets/DispoPilotAssets' spfx-build/config/write-manifests.json
+          grep -R '"SharePointFullPage"' spfx-build/src/webparts
+          grep -R 'DP_Users' spfx-build/src/webparts
+          grep -R 'window.location.reload()' spfx-build/src/webparts
+          grep -R 'n.acknowledgedAt=nowIso()' spfx-build/src/webparts
+
+      - name: Build production bundle
+        working-directory: spfx-build
+        run: npx heft build --production
+
+      - name: Package SharePoint solution
+        working-directory: spfx-build
+        run: npx heft package-solution --production
+
+      - name: Collect SiteAssets and package
+        run: |
+          set -e
+          rm -rf artifact
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS
+          mkdir -p artifact/UPLOAD_TO_APP_CATALOG
+
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n 1)
+          test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          if [ -d "spfx-build/release/assets" ]; then
+            cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d "spfx-build/temp/deploy" ]; then
+            cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else
+            echo "Keine SPFx Asset-Ausgabe gefunden."
+            find spfx-build -maxdepth 3 -type d | sort
+            exit 1
+          fi
+
+          test "$(find artifact/UPLOAD_TO_SITEASSETS -type f | wc -l)" -gt 0
+
+          echo "=== Dateien fuer SiteAssets ==="
+          find artifact/UPLOAD_TO_SITEASSETS -maxdepth 2 -type f -printf '%P\n' | sort
+          echo "=== App-Paket ==="
+          ls -lh artifact/UPLOAD_TO_APP_CATALOG/
+
+          cat > artifact/REIHENFOLGE.txt <<'EOF'
+          DispoPilot V1.3 - Bugfix E/F - technische Paketrevision 1.3.5.2
+
+          1. Alle Dateien aus UPLOAD_TO_SITEASSETS nach:
+             /sites/DispoPilot/SiteAssets/DispoPilotAssets
+             hochladen und vorhandene gleichnamige Dateien ersetzen, falls gefragt.
+
+          2. Danach:
+             UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+             im SharePoint App-Katalog hochladen, vorhandenes Paket ersetzen
+             und die App aktivieren.
+
+          3. Danach DispoPilot neu laden.
+
+          TEST E:
+          - Auf Geraet A einen Auftrag aendern/anlegen.
+          - Auf Geraet B in "Auftraege" auf "Aktualisieren" tippen.
+          - Die Seite wird neu geladen und muss danach den zentralen Stand zeigen.
+
+          TEST F:
+          - Als Disposition einen Fahrerauftrag aendern.
+          - Als Fahrer die Dispo-Meldung oeffnen.
+          - "Auftrag ansehen" waehlen.
+          - Auftrag wieder schliessen.
+          - Die zugehoerige Meldung muss danach quittiert sein und verschwinden.
+
+          Geaendert wurden nur:
+          E - Aktualisieren/Sync
+          F - Quittierung der Dispo-Aenderungsmeldung
+
+          Nicht geaendert:
+          A - mehrere Mulden
+          B - Muldeninhalt
+          C - Ansichten/Rollen
+          D - Fahrfolge
+          EOF
+
+      - name: Upload Bugfix E-F artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DispoPilot-V1.3-BUGFIX-EF
+          path: artifact/
+          if-no-files-found: error
