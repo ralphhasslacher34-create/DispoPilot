@@ -1,0 +1,1944 @@
+name: K1 ADRESSEN DispoPilot V1.3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Check sources
+        run: |
+          test -f dispopilot-online-app.html
+          test -f prepare-spfx-final.py
+          test -f patch-dp-users-v2.py
+          python3 -m py_compile prepare-spfx-final.py
+          python3 -m py_compile patch-dp-users-v2.py
+
+      - name: Apply existing Bugfix E and F
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          src = Path("dispopilot-online-app.html")
+          out = Path("dispopilot-online-efd-base.html")
+          text = src.read_text(encoding="utf-8")
+          text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+          old_e = '<button class="btn secondary" type="button" onclick="renderOrders()">Aktualisieren</button>'
+          new_e = '<button class="btn secondary" type="button" onclick="window.location.reload()">Aktualisieren</button>'
+          if text.count(old_e) != 1:
+              raise SystemExit(f"E abgebrochen: Aktualisieren-Muster {text.count(old_e)}x gefunden statt 1x.")
+          text = text.replace(old_e, new_e, 1)
+
+          pattern_f = re.compile(
+              r"""const\s+baseCloseM\s*=\s*closeM\s*;\s*
+                  closeM\s*=\s*function\s*\(\s*id\s*\)\s*\{\s*
+                  baseCloseM\s*\(\s*id\s*\)\s*;\s*
+                  if\s*\(\s*id\s*===\s*['\"]detailModal['\"]\s*&&\s*dp13ReturnNoticeId\s*\)\s*\{\s*
+                  dp13ReturnNoticeId\s*=\s*null\s*;\s*
+                  setTimeout\s*\(\s*dp13CheckNotices\s*,\s*40\s*\)\s*
+                  \}\s*
+                  \}\s*;""",
+              re.VERBOSE
+          )
+
+          replacement_f = """const baseCloseM=closeM;
+          closeM=function(id){
+            baseCloseM(id);
+            if(id==='detailModal'&&dp13ReturnNoticeId){
+              const noticeId=dp13ReturnNoticeId;
+              dp13ReturnNoticeId=null;
+              const n=dp13NoticeList().find(x=>x.id===noticeId);
+              if(n&&!n.acknowledgedAt){
+                n.acknowledgedAt=nowIso();
+                persist().then(()=>setTimeout(dp13CheckNotices,40));
+              }else{
+                setTimeout(dp13CheckNotices,40);
+              }
+            }
+          };"""
+
+          text, count_f = pattern_f.subn(replacement_f, text, count=1)
+          if count_f != 1:
+              raise SystemExit(f"F abgebrochen: Meldungs-Schließen-Muster {count_f}x gefunden statt 1x.")
+
+          out.write_text(text, encoding="utf-8", newline="\n")
+          print("E und F wurden übernommen.")
+          PY
+
+          grep -q 'onclick="window.location.reload()">Aktualisieren</button>' dispopilot-online-efd-base.html
+          grep -q "const noticeId=dp13ReturnNoticeId" dispopilot-online-efd-base.html
+          grep -q "n.acknowledgedAt=nowIso()" dispopilot-online-efd-base.html
+
+      - name: Apply D Fahrfolge
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("dispopilot-online-efd-base.html")
+          text = path.read_text(encoding="utf-8")
+
+          marker = "/* DP13_PATCH_BEGIN */"
+          if text.count(marker) != 1:
+              raise SystemExit(f"D abgebrochen: DP13-Marker {text.count(marker)}x gefunden statt 1x.")
+
+          d_patch = r"""
+          /* DP_D_FAHRFOLGE_BEGIN */
+          function dpDSequencedGroup(date,driver,excludeId=null){
+            return state.orders
+              .filter(o=>o.date===date&&o.driver===driver&&o.seq&&o.id!==excludeId)
+              .sort((a,b)=>(Number(a.seq)||999)-(Number(b.seq)||999)||Number(a.id||0)-Number(b.id||0));
+          }
+
+          function dpDApplySequence(list){
+            let changed=false;
+            list.forEach((o,i)=>{
+              const seq=i+1;
+              if(Number(o.seq)!==seq){
+                o.seq=seq;
+                o.updatedAt=nowIso();
+                changed=true;
+              }
+            });
+            return changed;
+          }
+
+          function dpDNormalizeGroup(date,driver,excludeId=null){
+            if(!date||!driver)return false;
+            return dpDApplySequence(dpDSequencedGroup(date,driver,excludeId));
+          }
+
+          function dpDInsertAt(order,requestedSeq){
+            if(!order||!order.date||!order.driver||!requestedSeq)return false;
+            const others=dpDSequencedGroup(order.date,order.driver,order.id);
+            const pos=Math.max(1,Math.min(Number(requestedSeq)||1,others.length+1));
+            others.splice(pos-1,0,order);
+            return dpDApplySequence(others);
+          }
+
+          const dpDBaseSaveOrder=saveOrder;
+          saveOrder=async function(){
+            const editId=editingOrderId;
+            const before=editId&&orderById(editId)?JSON.parse(JSON.stringify(orderById(editId))):null;
+            const beforeIds=new Set(state.orders.map(o=>o.id));
+            const requestedSeq=$('oSeq').value?Number($('oSeq').value):0;
+
+            await dpDBaseSaveOrder();
+
+            const saved=editId?orderById(editId):state.orders.find(o=>!beforeIds.has(o.id));
+            if(!saved)return;
+
+            let changed=false;
+            const oldGroup=before&&before.date&&before.driver?before.date+'|||'+before.driver:'';
+            const newGroup=saved.date&&saved.driver?saved.date+'|||'+saved.driver:'';
+
+            if(before&&oldGroup&&(oldGroup!==newGroup||!requestedSeq)){
+              changed=dpDNormalizeGroup(before.date,before.driver,saved.id)||changed;
+            }
+
+            if(saved.driver&&saved.date&&requestedSeq){
+              changed=dpDInsertAt(saved,requestedSeq)||changed;
+            }else if(saved.driver&&saved.date){
+              changed=dpDNormalizeGroup(saved.date,saved.driver,saved.id)||changed;
+            }
+
+            if(changed)await persist();
+            renderAll();
+          };
+
+          moveOrder=async function(id,dir){
+            const o=orderById(id);
+            if(!o||!o.driver||!o.seq)return;
+
+            const group=dpDSequencedGroup(o.date,o.driver);
+            dpDApplySequence(group);
+
+            const i=group.findIndex(x=>x.id===id);
+            const j=i+dir;
+            if(i<0||j<0||j>=group.length)return;
+
+            const [moved]=group.splice(i,1);
+            group.splice(j,0,moved);
+            dpDApplySequence(group);
+
+            await persist();
+            renderPlanning();
+          };
+          /* DP_D_FAHRFOLGE_END */
+          """
+
+          text = text.replace(marker, d_patch + "\n" + marker, 1)
+          path.write_text(text, encoding="utf-8", newline="\n")
+          print("D Fahrfolge wurde eingefügt.")
+          PY
+
+          grep -q "DP_D_FAHRFOLGE_BEGIN" dispopilot-online-efd-base.html
+          grep -q "dpDInsertAt" dispopilot-online-efd-base.html
+          grep -q "dpDNormalizeGroup" dispopilot-online-efd-base.html
+          grep -q "moveOrder=async function" dispopilot-online-efd-base.html
+
+      - name: Apply A multiple bins and B disposal logic
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("dispopilot-online-efd-base.html")
+          text = path.read_text(encoding="utf-8")
+
+          # A1: Anzahl Mulden von 1..3 auf 1..10 erweitern.
+          old_count = '<div><label>Anzahl Mulden</label><select id="oCount" onchange="binCountChanged()"><option>1</option><option>2</option><option>3</option></select></div>'
+          new_count = '<div><label>Anzahl Mulden</label><select id="oCount" onchange="binCountChanged()">' + ''.join(f'<option>{i}</option>' for i in range(1,11)) + '</select></div>'
+          if text.count(old_count) != 1:
+              raise SystemExit(f"A abgebrochen: Anzahl-Mulden-Feld {text.count(old_count)}x gefunden statt 1x.")
+          text = text.replace(old_count, new_count, 1)
+
+          # A2: Dynamische Muldennummern unter den vorhandenen Typfeldern.
+          anchor_numbers = '<div><label>Muldentyp 1</label><select id="oBin1"></select></div><div id="bin2Field"><label>Muldentyp 2</label><select id="oBin2"></select></div><div id="bin3Field"><label>Muldentyp 3</label><select id="oBin3"></select></div>'
+          replacement_numbers = anchor_numbers + '<div id="dpABBinNumberFields" style="grid-column:1/-1"></div>'
+          if text.count(anchor_numbers) != 1:
+              raise SystemExit(f"A abgebrochen: Mulden-Typblock {text.count(anchor_numbers)}x gefunden statt 1x.")
+          text = text.replace(anchor_numbers, replacement_numbers, 1)
+
+          # B1: Bei der Ausführung muss ausdrücklich bestätigt werden,
+          # ob tatsächlich entleert/entsorgt wurde.
+          anchor_disposal = '<div style="margin-top:12px"><label>Bemerkung</label><textarea id="statusNote"></textarea></div><button class="btn primary full" style="margin-top:14px" type="button" onclick="confirmStatus()">Status speichern</button>'
+          replacement_disposal = '<div style="margin-top:12px"><label>Bemerkung</label><textarea id="statusNote"></textarea></div><div class="switchline" style="margin-top:12px"><input id="statusDisposed" type="checkbox"><label for="statusDisposed" style="margin:0"><strong>Inhalt tatsächlich entleert / entsorgt</strong></label></div><div class="small" style="margin-top:5px">Nur aktivieren, wenn der Muldeninhalt wirklich abgeladen bzw. entsorgt wurde.</div><button class="btn primary full" style="margin-top:14px" type="button" onclick="confirmStatus()">Status speichern</button>'
+          if text.count(anchor_disposal) != 1:
+              raise SystemExit(f"B abgebrochen: Status-Bemerkungsblock {text.count(anchor_disposal)}x gefunden statt 1x.")
+          text = text.replace(anchor_disposal, replacement_disposal, 1)
+
+          marker = "/* DP13_PATCH_BEGIN */"
+          if text.count(marker) != 1:
+              raise SystemExit(f"AB abgebrochen: DP13-Marker {text.count(marker)}x gefunden statt 1x.")
+
+          patch = r"""
+          /* DP_AB_MULDEN_BEGIN */
+          function dpABNumbersFromOrder(o){
+            if(!o)return [];
+            return parsedBinNumbers(o.binNumbers||'').slice(0,10);
+          }
+
+          function dpABTypeForIndex(o,i){
+            if(o&&Array.isArray(o.binTypes)&&o.binTypes[i])return o.binTypes[i];
+            return [o?.bin1,o?.bin2,o?.bin3][i]||o?.bin1||'';
+          }
+
+          function dpABCollectNumbers(){
+            const n=Math.max(1,Math.min(10,Number($('oCount')?.value||1)));
+            const out=[];
+            for(let i=1;i<=n;i++){
+              const el=$('oBinNumber'+i);
+              out.push(el?el.value.trim():'');
+            }
+            return out;
+          }
+
+          function dpABCollectTypes(){
+            const n=Math.max(1,Math.min(10,Number($('oCount')?.value||1)));
+            const out=[];
+            for(let i=1;i<=n;i++){
+              if(i===1)out.push($('oBin1')?.value||'');
+              else if(i===2)out.push($('oBin2')?.value||'');
+              else if(i===3)out.push($('oBin3')?.value||'');
+              else out.push($('oBinType'+i)?.value||$('oBin1')?.value||'');
+            }
+            return out;
+          }
+
+          function dpABRenderBinFields(order=null,forceOrder=false){
+            const host=$('dpABBinNumberFields');
+            if(!host)return;
+            const n=Math.max(1,Math.min(10,Number($('oCount')?.value||1)));
+            const current={};
+            for(let i=1;i<=10;i++){
+              const el=$('oBinNumber'+i);
+              if(el)current[i]=el.value;
+            }
+            const planned=dpABNumbersFromOrder(order);
+            let html='<div class="section" style="margin-top:4px">Muldennummern</div><div class="miniGrid">';
+            for(let i=1;i<=n;i++){
+              const val=forceOrder?(planned[i-1]||''):(current[i]||planned[i-1]||'');
+              html+='<div><label>Muldennummer '+i+'</label><input id="oBinNumber'+i+'" inputmode="numeric" value="'+esc(val)+'" placeholder="Nummer '+i+'"></div>';
+              if(i>3){
+                const selected=dpABTypeForIndex(order,i-1);
+                html+='<div><label>Muldentyp '+i+'</label><select id="oBinType'+i+'">'+BIN_TYPES.map(x=>'<option '+(x===selected?'selected':'')+'>'+esc(x)+'</option>').join('')+'</select></div>';
+              }
+            }
+            html+='</div>';
+            host.innerHTML=html;
+          }
+
+          const dpABBaseBinCountChanged=binCountChanged;
+          binCountChanged=function(){
+            dpABBaseBinCountChanged();
+            dpABRenderBinFields(editingOrderId?orderById(editingOrderId):null,false);
+          };
+
+          const dpABBaseEditOrder=editOrder;
+          editOrder=function(id=null){
+            dpABBaseEditOrder(id);
+            dpABRenderBinFields(id?orderById(id):null,true);
+          };
+
+          const dpABBaseSaveOrder=saveOrder;
+          saveOrder=async function(){
+            const editId=editingOrderId;
+            const beforeIds=new Set(state.orders.map(o=>o.id));
+            const numbers=dpABCollectNumbers();
+            const types=dpABCollectTypes();
+            await dpABBaseSaveOrder();
+            const saved=editId?orderById(editId):state.orders.find(o=>!beforeIds.has(o.id));
+            if(!saved)return;
+            saved.count=Math.max(1,Math.min(10,Number(saved.count||numbers.length||1)));
+            saved.binNumbers=numbers.filter(Boolean).join(', ');
+            saved.binTypes=types.slice(0,saved.count);
+            if(saved.binTypes[0])saved.bin1=saved.binTypes[0];
+            if(saved.count>1&&saved.binTypes[1])saved.bin2=saved.binTypes[1];else if(saved.count<2)saved.bin2='';
+            if(saved.count>2&&saved.binTypes[2])saved.bin3=saved.binTypes[2];else if(saved.count<3)saved.bin3='';
+            saved.updatedAt=nowIso();
+            await persist();
+            renderAll();
+          };
+
+          orderBinType=function(o,i){
+            if(o&&Array.isArray(o.binTypes)&&o.binTypes[i])return o.binTypes[i];
+            return [o?.bin1,o?.bin2,o?.bin3][i]||o?.bin1||'';
+          };
+
+          confirmedNumbers=function(o,preferred=''){
+            const fromOrder=parsedBinNumbers(o?.binNumbers||'');
+            if(fromOrder.length)return fromOrder.slice(0,10);
+            const p=String(preferred||'').trim();
+            return p?[p]:[];
+          };
+
+          const dpABBaseSetStatus=setStatus;
+          setStatus=function(s){
+            dpABBaseSetStatus(s);
+            const o=orderById(currentOrderId);
+            if($('statusDisposed'))$('statusDisposed').checked=!!o?.disposed;
+          };
+
+          const dpABBaseConfirmStatus=confirmStatus;
+          confirmStatus=async function(){
+            const o=orderById(currentOrderId);
+            if(o)o.disposed=!!$('statusDisposed')?.checked;
+            await dpABBaseConfirmStatus();
+          };
+
+          applyBinMovement=function(o){
+            const c=customer(o.customerId),st=site(o.siteId),loc=`${c?.name||''} / ${st?.name||''}`;
+            const materialAfter=(b)=>o.disposed?'':(o.material||b.material||'');
+
+            if(['Stellen','Liefern'].includes(o.task)){
+              const nums=confirmedNumbers(o,o.newBinNumber);
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId,material:o.material||b.material});
+                addMovement(b,o,o.task,from,loc);
+              });
+            }else if(o.task==='Abholen'){
+              const nums=confirmedNumbers(o,o.existingBinNumber);
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Auf Lager',customerId:null,siteId:null,material:materialAfter(b)});
+                addMovement(b,o,'Abholen',from,'Auf Lager');
+              });
+            }else if(o.task==='Tauschen'){
+              const old=String(o.existingBinNumber||'').trim()||parsedBinNumbers(o.binNumbers)[0]||'';
+              const neu=String(o.newBinNumber||'').trim();
+              if(old){
+                const b=ensureBin(old,o.bin1),from=locationText(b);
+                Object.assign(b,{status:'Auf Lager',customerId:null,siteId:null,material:materialAfter(b)});
+                addMovement(b,o,'Tauschen – abgeholt',from,'Auf Lager');
+              }
+              if(neu){
+                const b=ensureBin(neu,o.bin1),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId,material:''});
+                addMovement(b,o,'Tauschen – gestellt',from,loc);
+              }
+            }else if(o.task==='Leeren'){
+              const nums=confirmedNumbers(o,o.existingBinNumber);
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId,material:materialAfter(b)});
+                addMovement(b,o,'Leeren',from,loc);
+              });
+            }else if(o.task==='Umstellen'){
+              const nums=confirmedNumbers(o,o.existingBinNumber);
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId});
+                addMovement(b,o,'Umstellen',from,loc);
+              });
+            }else if(o.task==='Transportieren'){
+              const nums=confirmedNumbers(o);
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,orderBinType(o,i)),from=locationText(b);
+                if(o.disposed)b.material='';
+                addMovement(b,o,'Transportieren',from,locationText(b));
+              });
+            }
+          };
+          /* DP_AB_MULDEN_END */
+          """
+
+          text = text.replace(marker, patch + "\n" + marker, 1)
+          path.write_text(text, encoding="utf-8", newline="\n")
+          print("A und B wurden eingefügt.")
+          PY
+
+          grep -q "DP_AB_MULDEN_BEGIN" dispopilot-online-efd-base.html
+          grep -q "<option>10</option>" dispopilot-online-efd-base.html
+          grep -q "dpABBinNumberFields" dispopilot-online-efd-base.html
+          grep -q "statusDisposed" dispopilot-online-efd-base.html
+          grep -q "materialAfter" dispopilot-online-efd-base.html
+
+      - name: Apply A2 multi-bin planning correction
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("dispopilot-online-efd-base.html")
+          text = path.read_text(encoding="utf-8")
+
+          marker = "/* DP13_PATCH_BEGIN */"
+          if text.count(marker) != 1:
+              raise SystemExit(f"A2 abgebrochen: DP13-Marker {text.count(marker)}x gefunden statt 1x.")
+
+          patch = r"""
+          /* DP_A2_MEHRMULDEN_BEGIN */
+          function dpA2Task(){return $('oTask')?.value||''}
+          function dpA2IsSwap(){return dpA2Task()==='Tauschen'}
+          function dpA2ExistingOnly(){return ['Abholen','Leeren','Umstellen','Transportieren'].includes(dpA2Task())}
+          function dpA2NewBins(){return ['Stellen','Liefern','Tauschen'].includes(dpA2Task())}
+
+          function dpA2OrderNumbers(o){
+            if(!o)return [];
+            return parsedBinNumbers(o.binNumbers||'').slice(0,10);
+          }
+
+          function dpA2OldNumbers(o){
+            if(!o)return [];
+            if(Array.isArray(o.existingBinNumbers))return o.existingBinNumbers.map(String).filter(Boolean).slice(0,10);
+            return o.existingBinNumber?[String(o.existingBinNumber)]:[];
+          }
+
+          function dpA2Types(o){
+            if(!o)return [];
+            if(Array.isArray(o.binTypes))return o.binTypes.slice(0,10);
+            return [o.bin1,o.bin2,o.bin3].filter(Boolean);
+          }
+
+          function dpA2ExistingOptions(selected=''){
+            const list=standingBins();
+            const seen=new Set();
+            const rows=[];
+            if(selected){
+              const b=binByNumber(selected);
+              rows.push({number:String(selected),type:b?.type||''});
+              seen.add(String(selected));
+            }
+            list.forEach(b=>{
+              const n=String(b.number);
+              if(!seen.has(n)){rows.push(b);seen.add(n)}
+            });
+            return '<option value="">— offen —</option>'+rows.map(b=>'<option value="'+esc(b.number)+'" '+(String(b.number)===String(selected)?'selected':'')+'>'+esc(b.number)+(b.type?' · '+esc(b.type):'')+'</option>').join('');
+          }
+
+          function dpA2TypeOptions(selected=''){
+            return BIN_TYPES.map(x=>'<option '+(x===selected?'selected':'')+'>'+esc(x)+'</option>').join('');
+          }
+
+          function dpA2AutoType(number){
+            return binByNumber(number)?.type||'Typ unbekannt';
+          }
+
+          function dpA2SyncType(i,old=false){
+            const el=$(old?'oSwapOld'+i:'oBinNumber'+i);
+            const target=$(old?'oSwapOldType'+i:'oExistingType'+i);
+            if(target)target.textContent=dpA2AutoType(el?.value||'');
+          }
+
+          dpABRenderBinFields=function(order=null,forceOrder=false){
+            const host=$('dpABBinNumberFields');
+            if(!host)return;
+
+            // Alte Einzel-/Dreifachfelder ausblenden. Die neue Zeilenansicht ist maßgeblich.
+            if($('oBin1')?.parentElement)$('oBin1').parentElement.classList.add('hidden');
+            if($('bin2Field'))$('bin2Field').classList.add('hidden');
+            if($('bin3Field'))$('bin3Field').classList.add('hidden');
+            if($('standingBinField'))$('standingBinField').classList.add('hidden');
+            if($('newBinField'))$('newBinField').classList.add('hidden');
+
+            const n=Math.max(1,Math.min(10,Number($('oCount')?.value||1)));
+            const planned=dpA2OrderNumbers(order);
+            const oldPlanned=dpA2OldNumbers(order);
+            const types=dpA2Types(order);
+
+            const currentNums={},currentOld={},currentTypes={};
+            for(let i=1;i<=10;i++){
+              if($('oBinNumber'+i))currentNums[i]=$('oBinNumber'+i).value;
+              if($('oSwapOld'+i))currentOld[i]=$('oSwapOld'+i).value;
+              if($('oBinType'+i))currentTypes[i]=$('oBinType'+i).value;
+            }
+
+            let html='<div class="section" style="margin-top:4px">Mulden</div>';
+            html+='<div style="display:grid;gap:8px">';
+
+            for(let i=1;i<=n;i++){
+              const num=forceOrder?(planned[i-1]||''):(currentNums[i]??planned[i-1]??'');
+              const typ=forceOrder?(types[i-1]||''):(currentTypes[i]??types[i-1]??'');
+              const old=forceOrder?(oldPlanned[i-1]||''):(currentOld[i]??oldPlanned[i-1]??'');
+
+              html+='<div style="display:grid;grid-template-columns:minmax(64px,.55fr) minmax(120px,1fr) minmax(120px,1fr)'+(dpA2IsSwap()?' minmax(140px,1.1fr)':'')+';gap:8px;align-items:end;padding:9px;border:1px solid #e5e7eb;border-radius:10px;background:#f9fafb">';
+              html+='<div><strong>Mulde '+i+'</strong></div>';
+
+              if(dpA2ExistingOnly()){
+                html+='<div><label>Nummer</label><select id="oBinNumber'+i+'" onchange="dpA2SyncType('+i+')">'+dpA2ExistingOptions(num)+'</select></div>';
+                html+='<div><label>Typ</label><div id="oExistingType'+i+'" style="min-height:42px;padding:10px;border:1px solid #d6dbe1;border-radius:9px;background:#fff">'+esc(dpA2AutoType(num))+'</div></div>';
+              }else{
+                html+='<div><label>Nummer</label><input id="oBinNumber'+i+'" inputmode="numeric" value="'+esc(num)+'" placeholder="Muldennummer"></div>';
+                html+='<div><label>Typ</label><select id="oBinType'+i+'">'+dpA2TypeOptions(typ||$('oBin1')?.value||'')+'</select></div>';
+              }
+
+              if(dpA2IsSwap()){
+                html+='<div><label>Abgeholte Nr.</label><select id="oSwapOld'+i+'" onchange="dpA2SyncType('+i+',true)">'+dpA2ExistingOptions(old)+'</select><div class="small" style="margin-top:4px">Typ: <span id="oSwapOldType'+i+'">'+esc(dpA2AutoType(old))+'</span></div></div>';
+              }
+
+              html+='</div>';
+            }
+            html+='</div>';
+            host.innerHTML=html;
+          };
+
+          dpABCollectNumbers=function(){
+            const n=Math.max(1,Math.min(10,Number($('oCount')?.value||1)));
+            const out=[];
+            for(let i=1;i<=n;i++)out.push(String($('oBinNumber'+i)?.value||'').trim());
+            return out;
+          };
+
+          dpABCollectTypes=function(){
+            const nums=dpABCollectNumbers();
+            const n=nums.length;
+            const out=[];
+            for(let i=1;i<=n;i++){
+              if(dpA2ExistingOnly())out.push(binByNumber(nums[i-1])?.type||'');
+              else out.push($('oBinType'+i)?.value||'');
+            }
+            return out;
+          };
+
+          function dpA2CollectOldNumbers(){
+            if(!dpA2IsSwap())return [];
+            const n=Math.max(1,Math.min(10,Number($('oCount')?.value||1)));
+            const out=[];
+            for(let i=1;i<=n;i++)out.push(String($('oSwapOld'+i)?.value||'').trim());
+            return out;
+          }
+
+          function dpA2HasDuplicate(arr){
+            const v=arr.filter(Boolean);
+            return new Set(v).size!==v.length;
+          }
+
+          const dpA2BaseTaskChanged=taskChanged;
+          taskChanged=function(){
+            dpA2BaseTaskChanged();
+            if($('standingBinField'))$('standingBinField').classList.add('hidden');
+            if($('newBinField'))$('newBinField').classList.add('hidden');
+            dpABRenderBinFields(editingOrderId?orderById(editingOrderId):null,false);
+          };
+
+          const dpA2BaseSaveOrder=saveOrder;
+          saveOrder=async function(){
+            const editId=editingOrderId;
+            const beforeIds=new Set(state.orders.map(o=>o.id));
+            const nums=dpABCollectNumbers();
+            const oldNums=dpA2CollectOldNumbers();
+            const types=dpABCollectTypes();
+
+            if(dpA2HasDuplicate(nums))return alert('Eine Muldennummer wurde mehrfach eingegeben. Bitte jede Mulde nur einmal verwenden.');
+            if(dpA2HasDuplicate(oldNums))return alert('Eine abgeholte Mulde wurde beim Tauschen mehrfach ausgewählt.');
+
+            await dpA2BaseSaveOrder();
+
+            const saved=editId?orderById(editId):state.orders.find(o=>!beforeIds.has(o.id));
+            if(!saved)return;
+
+            saved.binNumbers=nums.filter(Boolean).join(', ');
+            saved.binTypes=types.slice(0,Math.max(1,Number(saved.count||1)));
+
+            if(dpA2IsSwap()){
+              saved.newBinNumbers=nums.filter(Boolean);
+              saved.existingBinNumbers=oldNums.filter(Boolean);
+              saved.newBinNumber=saved.newBinNumbers[0]||'';
+              saved.existingBinNumber=saved.existingBinNumbers[0]||'';
+            }else if(dpA2ExistingOnly()){
+              saved.existingBinNumbers=nums.filter(Boolean);
+              saved.existingBinNumber=saved.existingBinNumbers[0]||'';
+              saved.newBinNumbers=[];
+              saved.newBinNumber='';
+            }else if(dpA2NewBins()){
+              saved.newBinNumbers=nums.filter(Boolean);
+              saved.newBinNumber=saved.newBinNumbers[0]||'';
+              saved.existingBinNumbers=[];
+              saved.existingBinNumber='';
+            }
+
+            saved.updatedAt=nowIso();
+            await persist();
+            renderAll();
+          };
+
+          applyBinMovement=function(o){
+            const c=customer(o.customerId),st=site(o.siteId),loc=`${c?.name||''} / ${st?.name||''}`;
+            const nums=parsedBinNumbers(o.binNumbers||'').slice(0,10);
+            const oldNums=Array.isArray(o.existingBinNumbers)?o.existingBinNumbers.map(String).filter(Boolean):[];
+            const materialAfter=(b)=>o.disposed?'':(b.material||o.material||'');
+
+            if(['Stellen','Liefern'].includes(o.task)){
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId,material:o.material||b.material});
+                addMovement(b,o,o.task,from,loc);
+              });
+            }else if(o.task==='Abholen'){
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,binByNumber(n)?.type||orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Auf Lager',customerId:null,siteId:null,material:materialAfter(b)});
+                addMovement(b,o,'Abholen',from,'Auf Lager');
+              });
+            }else if(o.task==='Tauschen'){
+              const max=Math.max(nums.length,oldNums.length,Number(o.count||1));
+              for(let i=0;i<max;i++){
+                const old=oldNums[i]||'';
+                const neu=nums[i]||'';
+
+                if(old){
+                  const oldBin=ensureBin(old,binByNumber(old)?.type||''),from=locationText(oldBin);
+                  Object.assign(oldBin,{status:'Auf Lager',customerId:null,siteId:null,material:materialAfter(oldBin)});
+                  addMovement(oldBin,o,'Tauschen – abgeholt',from,'Auf Lager');
+                }
+
+                if(neu){
+                  const newBin=ensureBin(neu,orderBinType(o,i)),from=locationText(newBin);
+                  Object.assign(newBin,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId,material:''});
+                  addMovement(newBin,o,'Tauschen – gestellt',from,loc);
+                }
+              }
+            }else if(o.task==='Leeren'){
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,binByNumber(n)?.type||orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId,material:materialAfter(b)});
+                addMovement(b,o,'Leeren',from,loc);
+              });
+            }else if(o.task==='Umstellen'){
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,binByNumber(n)?.type||orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId});
+                if(o.disposed)b.material='';
+                addMovement(b,o,'Umstellen',from,loc);
+              });
+            }else if(o.task==='Transportieren'){
+              nums.forEach((n,i)=>{
+                const b=ensureBin(n,binByNumber(n)?.type||orderBinType(o,i)),from=locationText(b);
+                if(o.disposed)b.material='';
+                addMovement(b,o,'Transportieren',from,locationText(b));
+              });
+            }
+          };
+
+          const dpA2BaseOpenDetail=openDetail;
+          openDetail=function(id){
+            dpA2BaseOpenDetail(id);
+            const o=orderById(id);
+            if(!o)return;
+            const nums=parsedBinNumbers(o.binNumbers||'');
+            const olds=Array.isArray(o.existingBinNumbers)?o.existingBinNumbers:[];
+            const body=$('detailBody');
+            if(body&&nums.length){
+              const extra=document.createElement('div');
+              extra.className='card';
+              extra.innerHTML='<strong>Geplante Mulden</strong><div style="margin-top:6px">'+nums.map((n,i)=>'Mulde '+(i+1)+': <strong>'+esc(n)+'</strong>'+(orderBinType(o,i)?' · '+esc(orderBinType(o,i)):'')+(o.task==='Tauschen'&&olds[i]?' · abgeholt: <strong>'+esc(olds[i])+'</strong>':'')).join('<br>')+'</div>';
+              body.appendChild(extra);
+            }
+          };
+          /* DP_A2_MEHRMULDEN_END */
+          """
+
+          text = text.replace(marker, patch + "\n" + marker, 1)
+          path.write_text(text, encoding="utf-8", newline="\n")
+          print("A2 Mehrmulden-Planung wurde eingefügt.")
+          PY
+
+          grep -q "DP_A2_MEHRMULDEN_BEGIN" dispopilot-online-efd-base.html
+          grep -q "Abgeholte Nr." dispopilot-online-efd-base.html
+          grep -q "existingBinNumbers" dispopilot-online-efd-base.html
+          grep -q "Geplante Mulden" dispopilot-online-efd-base.html
+
+      - name: Apply A3 driver confirmation of moved bins
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("dispopilot-online-efd-base.html")
+          text = path.read_text(encoding="utf-8")
+
+          # Strukturierte Fahrer-Bestätigung in den Abschlussdialog einfügen.
+          old_status = '<div><label>Muldennummer(n) / Zusatz</label><input id="statusBins"></div><div><label>LS-Nr.</label><input id="statusLs"></div>'
+          new_status = '<div><label>Muldennummer(n) / Zusatz</label><input id="statusBins"></div><div><label>LS-Nr.</label><input id="statusLs"></div><div id="dpA3ConfirmBins" style="grid-column:1/-1"></div>'
+          if text.count(old_status) != 1:
+              raise SystemExit(
+                  f"A3 abgebrochen: Abschluss-Muldenfeld {text.count(old_status)}x gefunden statt 1x."
+              )
+          text = text.replace(old_status, new_status, 1)
+
+          marker = "/* DP13_PATCH_BEGIN */"
+          if text.count(marker) != 1:
+              raise SystemExit(
+                  f"A3 abgebrochen: DP13-Marker {text.count(marker)}x gefunden statt 1x."
+              )
+
+          patch = r"""
+          /* DP_A3_FAHRERBESTAETIGUNG_BEGIN */
+          function dpA3BinTask(o){
+            return !!o&&['Stellen','Liefern','Tauschen','Abholen','Leeren','Umstellen','Transportieren'].includes(o.task);
+          }
+
+          function dpA3ExistingTask(o){
+            return !!o&&['Abholen','Leeren','Umstellen','Transportieren'].includes(o.task);
+          }
+
+          function dpA3PlannedMain(o){
+            if(!o)return [];
+            if(Array.isArray(o.newBinNumbers)&&['Stellen','Liefern','Tauschen'].includes(o.task)&&o.newBinNumbers.length)
+              return o.newBinNumbers.map(String).filter(Boolean).slice(0,10);
+            return parsedBinNumbers(o.binNumbers||'').slice(0,10);
+          }
+
+          function dpA3PlannedOld(o){
+            if(!o)return [];
+            if(Array.isArray(o.existingBinNumbers)&&o.existingBinNumbers.length)
+              return o.existingBinNumbers.map(String).filter(Boolean).slice(0,10);
+            return o.existingBinNumber?[String(o.existingBinNumber)]:[];
+          }
+
+          function dpA3ActualMain(o){
+            if(Array.isArray(o?.actualBinNumbers)&&o.actualBinNumbers.length)
+              return o.actualBinNumbers.map(String).filter(Boolean).slice(0,10);
+            return dpA3PlannedMain(o);
+          }
+
+          function dpA3ActualOld(o){
+            if(Array.isArray(o?.actualExistingBinNumbers)&&o.actualExistingBinNumbers.length)
+              return o.actualExistingBinNumbers.map(String).filter(Boolean).slice(0,10);
+            return dpA3PlannedOld(o);
+          }
+
+          function dpA3Count(o){
+            return Math.max(
+              1,
+              Math.min(
+                10,
+                Number(o?.count||1),
+                10
+              )
+            );
+          }
+
+          function dpA3LocationBins(o,selected=''){
+            const rows=[];
+            const seen=new Set();
+
+            if(selected){
+              const b=binByNumber(selected);
+              rows.push({number:String(selected),type:b?.type||''});
+              seen.add(String(selected));
+            }
+
+            state.bins
+              .filter(b=>{
+                if(b.status!=='Beim Kunden')return false;
+                if(o?.siteId&&b.siteId==o.siteId)return true;
+                return !o?.siteId&&o?.customerId&&b.customerId==o.customerId;
+              })
+              .sort((a,b)=>String(a.number).localeCompare(String(b.number),'de',{numeric:true}))
+              .forEach(b=>{
+                const n=String(b.number);
+                if(!seen.has(n)){
+                  rows.push(b);
+                  seen.add(n);
+                }
+              });
+
+            return rows;
+          }
+
+          function dpA3ExistingSelect(o,i,selected='',role='main'){
+            const options=dpA3LocationBins(o,selected)
+              .map(b=>'<option value="'+esc(b.number)+'" '+(String(b.number)===String(selected)?'selected':'')+'>'+esc(b.number)+(b.type?' · '+esc(b.type):'')+'</option>')
+              .join('');
+
+            return '<select id="dpA3_'+role+'_'+i+'" onchange="dpA3ExistingChanged('+i+',\''+role+'\')">'
+              +'<option value="">— bitte wählen —</option>'
+              +options
+              +'<option value="__manual__">Nummer manuell eingeben …</option>'
+              +'</select>'
+              +'<input id="dpA3_'+role+'Manual_'+i+'" class="hidden" style="margin-top:6px" inputmode="numeric" placeholder="Muldennummer manuell" oninput="dpA3RefreshType('+i+',\''+role+'\')">';
+          }
+
+          function dpA3Value(i,role='main'){
+            const el=$('dpA3_'+role+'_'+i);
+            if(!el)return '';
+            if(el.tagName==='SELECT'&&el.value==='__manual__')
+              return String($('dpA3_'+role+'Manual_'+i)?.value||'').trim();
+            return String(el.value||'').trim();
+          }
+
+          function dpA3ExistingChanged(i,role='main'){
+            const el=$('dpA3_'+role+'_'+i);
+            const manual=$('dpA3_'+role+'Manual_'+i);
+            if(manual)manual.classList.toggle('hidden',el?.value!=='__manual__');
+            dpA3RefreshType(i,role);
+          }
+
+          function dpA3RefreshType(i,role='main'){
+            const t=$('dpA3_'+role+'Type_'+i);
+            if(!t)return;
+            const n=dpA3Value(i,role);
+            t.textContent=binByNumber(n)?.type||'Typ unbekannt';
+          }
+
+          function dpA3RenderConfirm(o,status){
+            const host=$('dpA3ConfirmBins');
+            if(!host)return;
+
+            const generic=$('statusBins')?.parentElement;
+            if(status!=='Ausgeführt'||!dpA3BinTask(o)){
+              host.innerHTML='';
+              host.classList.add('hidden');
+              if(generic)generic.classList.remove('hidden');
+              return;
+            }
+
+            host.classList.remove('hidden');
+            if(generic)generic.classList.add('hidden');
+
+            const n=dpA3Count(o);
+            const main=dpA3ActualMain(o);
+            const old=dpA3ActualOld(o);
+            const swap=o.task==='Tauschen';
+            const existing=dpA3ExistingTask(o);
+
+            let html='<div class="section" style="margin-top:4px">Tatsächlich bewegte Mulden bestätigen</div>';
+            html+='<div class="notice" style="margin-bottom:8px">Die Planung ist vorgefüllt. Bitte vor „Ausgeführt“ die tatsächlich bewegten Mulden bestätigen bzw. bei Abweichung korrigieren.</div>';
+            html+='<div style="display:grid;gap:8px">';
+
+            for(let i=1;i<=n;i++){
+              const plannedMain=main[i-1]||'';
+              const plannedOld=old[i-1]||'';
+              const type=orderBinType(o,i-1)||binByNumber(plannedMain)?.type||'';
+
+              html+='<div style="display:grid;grid-template-columns:minmax(64px,.5fr) minmax(130px,1fr) minmax(110px,.8fr)'+(swap?' minmax(150px,1fr)':'')+';gap:8px;align-items:end;padding:9px;border:1px solid #e5e7eb;border-radius:10px;background:#f9fafb">';
+              html+='<div><strong>Mulde '+i+'</strong></div>';
+
+              if(existing){
+                html+='<div><label>Tatsächliche Nr.</label>'+dpA3ExistingSelect(o,i,plannedMain,'main')+'</div>';
+                html+='<div><label>Typ</label><div id="dpA3_mainType_'+i+'" style="min-height:42px;padding:10px;border:1px solid #d6dbe1;border-radius:9px;background:#fff">'+esc(binByNumber(plannedMain)?.type||type||'Typ unbekannt')+'</div></div>';
+              }else{
+                html+='<div><label>Tatsächliche Nr.</label><input id="dpA3_main_'+i+'" inputmode="numeric" value="'+esc(plannedMain)+'" placeholder="Muldennummer"></div>';
+                html+='<div><label>Typ</label><div style="min-height:42px;padding:10px;border:1px solid #d6dbe1;border-radius:9px;background:#fff">'+esc(type||'Typ offen')+'</div></div>';
+              }
+
+              if(swap){
+                html+='<div><label>Tatsächlich abgeholt</label>'+dpA3ExistingSelect(o,i,plannedOld,'old')+'<div class="small" style="margin-top:4px">Typ: <span id="dpA3_oldType_'+i+'">'+esc(binByNumber(plannedOld)?.type||'Typ unbekannt')+'</span></div></div>';
+              }
+
+              html+='</div>';
+            }
+
+            html+='</div>';
+            host.innerHTML=html;
+
+            for(let i=1;i<=n;i++){
+              if(existing)dpA3ExistingChanged(i,'main');
+              if(swap)dpA3ExistingChanged(i,'old');
+            }
+          }
+
+          function dpA3Collect(o,role='main'){
+            const n=dpA3Count(o);
+            const out=[];
+            for(let i=1;i<=n;i++)out.push(dpA3Value(i,role));
+            return out;
+          }
+
+          function dpA3Duplicates(arr){
+            const vals=arr.filter(Boolean);
+            return new Set(vals).size!==vals.length;
+          }
+
+          const dpA3BaseSetStatus=setStatus;
+          setStatus=function(s){
+            dpA3BaseSetStatus(s);
+            dpA3RenderConfirm(orderById(currentOrderId),s);
+          };
+
+          const dpA3BaseConfirmStatus=confirmStatus;
+          confirmStatus=async function(){
+            const o=orderById(currentOrderId);
+
+            if(pendingStatus==='Ausgeführt'&&dpA3BinTask(o)){
+              const actual=dpA3Collect(o,'main');
+              const old=o.task==='Tauschen'?dpA3Collect(o,'old'):[];
+
+              if(actual.some(x=>!x))
+                return alert('Bitte für jede bewegte Mulde die tatsächliche Muldennummer bestätigen.');
+              if(o.task==='Tauschen'&&old.some(x=>!x))
+                return alert('Bitte beim Tauschen für jede Zeile auch die tatsächlich abgeholte Mulde bestätigen.');
+              if(dpA3Duplicates(actual))
+                return alert('Eine tatsächliche Muldennummer wurde mehrfach verwendet.');
+              if(dpA3Duplicates(old))
+                return alert('Eine abgeholte Mulde wurde mehrfach verwendet.');
+
+              o.actualBinNumbers=actual;
+              o.actualExistingBinNumbers=old;
+              o.actualConfirmedAt=nowIso();
+              o.actualConfirmedBy=state.user.name||'';
+
+              // Wenn in der Planung keine Nummer hinterlegt war, wird die
+              // beim Fahrer bestätigte tatsächliche Nummer zum effektiven Wert.
+              if(!parsedBinNumbers(o.binNumbers||'').length)
+                o.binNumbers=actual.join(', ');
+
+              if(o.task==='Tauschen'){
+                if((!Array.isArray(o.existingBinNumbers)||!o.existingBinNumbers.length)&&old.length)
+                  o.existingBinNumbers=old.slice();
+                if(!o.existingBinNumber&&old[0])o.existingBinNumber=old[0];
+                if((!Array.isArray(o.newBinNumbers)||!o.newBinNumbers.length)&&actual.length)
+                  o.newBinNumbers=actual.slice();
+                if(!o.newBinNumber&&actual[0])o.newBinNumber=actual[0];
+              }else if(dpA3ExistingTask(o)){
+                if((!Array.isArray(o.existingBinNumbers)||!o.existingBinNumbers.length)&&actual.length)
+                  o.existingBinNumbers=actual.slice();
+                if(!o.existingBinNumber&&actual[0])o.existingBinNumber=actual[0];
+              }else{
+                if((!Array.isArray(o.newBinNumbers)||!o.newBinNumbers.length)&&actual.length)
+                  o.newBinNumbers=actual.slice();
+                if(!o.newBinNumber&&actual[0])o.newBinNumber=actual[0];
+              }
+            }
+
+            await dpA3BaseConfirmStatus();
+          };
+
+          applyBinMovement=function(o){
+            const c=customer(o.customerId),st=site(o.siteId),loc=`${c?.name||''} / ${st?.name||''}`;
+            const planned=parsedBinNumbers(o.binNumbers||'').slice(0,10);
+            const actual=(Array.isArray(o.actualBinNumbers)&&o.actualBinNumbers.length?o.actualBinNumbers:planned).map(String).filter(Boolean).slice(0,10);
+            const plannedOld=Array.isArray(o.existingBinNumbers)?o.existingBinNumbers.map(String).filter(Boolean):[];
+            const actualOld=(Array.isArray(o.actualExistingBinNumbers)&&o.actualExistingBinNumbers.length?o.actualExistingBinNumbers:plannedOld).map(String).filter(Boolean).slice(0,10);
+            const materialAfter=(b)=>o.disposed?'':(b.material||o.material||'');
+
+            if(['Stellen','Liefern'].includes(o.task)){
+              actual.forEach((n,i)=>{
+                const b=ensureBin(n,orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId,material:o.material||b.material});
+                addMovement(b,o,o.task,from,loc);
+              });
+            }else if(o.task==='Abholen'){
+              actual.forEach((n,i)=>{
+                const b=ensureBin(n,binByNumber(n)?.type||orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Auf Lager',customerId:null,siteId:null,material:materialAfter(b)});
+                addMovement(b,o,'Abholen',from,'Auf Lager');
+              });
+            }else if(o.task==='Tauschen'){
+              const max=Math.max(actual.length,actualOld.length,Number(o.count||1));
+              for(let i=0;i<max;i++){
+                const old=actualOld[i]||'';
+                const neu=actual[i]||'';
+
+                if(old){
+                  const oldBin=ensureBin(old,binByNumber(old)?.type||''),from=locationText(oldBin);
+                  Object.assign(oldBin,{status:'Auf Lager',customerId:null,siteId:null,material:materialAfter(oldBin)});
+                  addMovement(oldBin,o,'Tauschen – abgeholt',from,'Auf Lager');
+                }
+
+                if(neu){
+                  const newBin=ensureBin(neu,orderBinType(o,i)),from=locationText(newBin);
+                  Object.assign(newBin,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId,material:''});
+                  addMovement(newBin,o,'Tauschen – gestellt',from,loc);
+                }
+              }
+            }else if(o.task==='Leeren'){
+              actual.forEach((n,i)=>{
+                const b=ensureBin(n,binByNumber(n)?.type||orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId,material:materialAfter(b)});
+                addMovement(b,o,'Leeren',from,loc);
+              });
+            }else if(o.task==='Umstellen'){
+              actual.forEach((n,i)=>{
+                const b=ensureBin(n,binByNumber(n)?.type||orderBinType(o,i)),from=locationText(b);
+                Object.assign(b,{status:'Beim Kunden',customerId:o.customerId,siteId:o.siteId});
+                if(o.disposed)b.material='';
+                addMovement(b,o,'Umstellen',from,loc);
+              });
+            }else if(o.task==='Transportieren'){
+              actual.forEach((n,i)=>{
+                const b=ensureBin(n,binByNumber(n)?.type||orderBinType(o,i)),from=locationText(b);
+                if(o.disposed)b.material='';
+                addMovement(b,o,'Transportieren',from,locationText(b));
+              });
+            }
+          };
+
+          const dpA3BaseOpenDetail=openDetail;
+          openDetail=function(id){
+            dpA3BaseOpenDetail(id);
+            const o=orderById(id);
+            if(!o||!o.actualConfirmedAt)return;
+
+            const actual=Array.isArray(o.actualBinNumbers)?o.actualBinNumbers:[];
+            const old=Array.isArray(o.actualExistingBinNumbers)?o.actualExistingBinNumbers:[];
+            const body=$('detailBody');
+            if(!body||!actual.length)return;
+
+            const card=document.createElement('div');
+            card.className='card';
+            card.innerHTML='<strong>Tatsächlich ausgeführt</strong><div class="small" style="margin-bottom:6px">'+esc(o.actualConfirmedBy||'Fahrer')+' · '+new Date(o.actualConfirmedAt).toLocaleString('de-DE')+'</div>'
+              +actual.map((n,i)=>'Mulde '+(i+1)+': <strong>'+esc(n)+'</strong>'
+                +(orderBinType(o,i)?' · '+esc(orderBinType(o,i)):'')
+                +(o.task==='Tauschen'&&old[i]?' · abgeholt: <strong>'+esc(old[i])+'</strong>':'')
+              ).join('<br>');
+            body.appendChild(card);
+          };
+          /* DP_A3_FAHRERBESTAETIGUNG_END */
+          """
+
+          text = text.replace(marker, patch + "\n" + marker, 1)
+          path.write_text(text, encoding="utf-8", newline="\n")
+          print("A3 Fahrerbestätigung wurde eingefügt.")
+          PY
+
+          grep -q "DP_A3_FAHRERBESTAETIGUNG_BEGIN" dispopilot-online-efd-base.html
+          grep -q "Tatsächlich bewegte Mulden bestätigen" dispopilot-online-efd-base.html
+          grep -q "actualExistingBinNumbers" dispopilot-online-efd-base.html
+          grep -q "actualConfirmedBy" dispopilot-online-efd-base.html
+
+      - name: Apply G3 independent auto refresh and status colors
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("dispopilot-online-efd-base.html")
+          text = path.read_text(encoding="utf-8")
+
+          marker = "/* DP13_PATCH_BEGIN */"
+          if text.count(marker) != 1:
+              raise SystemExit(
+                  f"G3 abgebrochen: DP13-Marker {text.count(marker)}x gefunden statt 1x."
+              )
+
+          patch = r"""
+          /* DP_G3_AUTOREFRESH_BEGIN */
+          const DP_G3_REFRESH_MS=60000;
+          const DP_G3_RETRY_MS=10000;
+          let dpG3Running=false;
+          let dpG3Timer=null;
+          let dpG3LastSuccess=0;
+          let dpG3Cycle=0;
+
+          function dpG3ModalOpen(){
+            return !!document.querySelector('.modal.show');
+          }
+
+          function dpG3Status(msg){
+            const el=$('storageStatus');
+            if(el)el.textContent=msg;
+          }
+
+          function dpG3RenderVisibleScreen(){
+            const active=document.querySelector('.screen.active');
+            const id=active?.id||'home';
+
+            try{
+              refreshCustomerSelects();
+              renderMaterialsDatalist();
+            }catch(_){}
+
+            if(id==='planning')renderPlanning();
+            else if(id==='orders')renderOrders();
+            else if(id==='customers')renderCustomers();
+            else if(id==='sites')renderSites();
+            else if(id==='time')renderTime();
+            else if(id==='bins')renderBins();
+            else if(id==='history')renderHistory();
+            else if(id==='settings')renderSettings();
+
+            if(typeof dp13CheckNotices==='function'){
+              setTimeout(dp13CheckNotices,50);
+            }
+          }
+
+          async function dpG3FetchFreshState(){
+            // SPStore.load() verwendet dieselbe funktionierende REST-Logik wie
+            // der normale Programmstart. Für GET wird der Browsercache umgangen.
+            const originalRequest=SPStore.request.bind(SPStore);
+
+            SPStore.request=async function(url,opts={}){
+              const method=String(opts.method||'GET').toUpperCase();
+              if(method==='GET'){
+                const headers={
+                  ...(opts.headers||{}),
+                  'Cache-Control':'no-cache, no-store, max-age=0',
+                  'Pragma':'no-cache',
+                  'Expires':'0'
+                };
+                return originalRequest(url,{
+                  ...opts,
+                  headers,
+                  cache:'no-store'
+                });
+              }
+              return originalRequest(url,opts);
+            };
+
+            try{
+              return await SPStore.load();
+            }finally{
+              SPStore.request=originalRequest;
+            }
+          }
+
+          async function dpG3Poll(){
+            if(dpG3Running)return;
+
+            // Niemals ein geöffnetes Formular/Detail während der Arbeit ersetzen.
+            if(dpG3ModalOpen()){
+              dpG3Status('Zentrale Datenbank · Auto-Sync pausiert (Formular offen)');
+              return;
+            }
+
+            if(!state){
+              dpG3Status('Zentrale Datenbank · Auto-Sync wartet auf Programmstart');
+              return;
+            }
+
+            dpG3Running=true;
+            dpG3Cycle++;
+
+            try{
+              dpG3Status('Zentrale Datenbank · Auto-Sync prüft …');
+
+              const sessionUser=clone(state.user||{});
+              const oldSignature=JSON.stringify({
+                orders:state.orders||[],
+                notices:state.dispoNotices||[],
+                bins:state.bins||[]
+              });
+
+              const loaded=await dpG3FetchFreshState();
+              const fresh=migrateState(loaded.state||clone(SEED));
+              fresh.user=sessionUser;
+
+              const newSignature=JSON.stringify({
+                orders:fresh.orders||[],
+                notices:fresh.dispoNotices||[],
+                bins:fresh.bins||[]
+              });
+
+              state=fresh;
+              dpG3LastSuccess=Date.now();
+
+              dpG3RenderVisibleScreen();
+
+              const changed=oldSignature!==newSignature;
+              dpG3Status(
+                'Zentrale Datenbank · Auto-Sync '
+                +new Date().toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'})
+                +(changed?' · Änderung übernommen':' · aktuell')
+              );
+            }catch(e){
+              console.error('DispoPilot G3 Auto-Sync:',e);
+              dpG3Status(
+                '⚠ Auto-Sync Fehler · '
+                +new Date().toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'})
+              );
+            }finally{
+              dpG3Running=false;
+            }
+          }
+
+          function dpG3Schedule(){
+            if(dpG3Timer)return;
+
+            // Unabhängig von DOMContentLoaded/load und damit auch robust,
+            // wenn der nachgelagerte Benutzer-/Rollenpatch die Startsequenz ändert.
+            const waitUntilReady=()=>{
+              if(typeof state!=='undefined'&&state){
+                dpG3Status('Zentrale Datenbank · Auto-Sync aktiv');
+                setTimeout(dpG3Poll,3000);
+                dpG3Timer=setInterval(dpG3Poll,DP_G3_REFRESH_MS);
+              }else{
+                setTimeout(waitUntilReady,DP_G3_RETRY_MS);
+              }
+            };
+            setTimeout(waitUntilReady,1000);
+          }
+
+          // Zusätzlich bei Rückkehr/Fokus sofort prüfen, wenn kein Formular offen ist.
+          window.addEventListener('focus',()=>{
+            if(!dpG3ModalOpen()&&Date.now()-dpG3LastSuccess>30000)setTimeout(dpG3Poll,300);
+          });
+
+          document.addEventListener('visibilitychange',()=>{
+            if(document.visibilityState==='visible'&&!dpG3ModalOpen()&&Date.now()-dpG3LastSuccess>30000){
+              setTimeout(dpG3Poll,300);
+            }
+          });
+
+          // Status-Farblogik:
+          // Geplant grün, In Arbeit gelb, Ausgeführt grau, alles andere rot.
+          if(!document.getElementById('dpStatusColorLogic')){
+            const st=document.createElement('style');
+            st.id='dpStatusColorLogic';
+            st.textContent='.status.dpPlanned{background:#dcfce7;color:#166534}.status.dpWorkYellow{background:#fef3c7;color:#92400e}.status.dpDoneGray{background:#e5e7eb;color:#374151}.status.dpAttention{background:#fee2e2;color:#991b1b}';
+            document.head.appendChild(st);
+          }
+
+          orderCard=function(o){
+            const c=customer(o.customerId),s=site(o.siteId);
+            const cls=o.status==='Geplant'?'dpPlanned':
+              o.status==='In Arbeit'?'dpWorkYellow':
+              o.status==='Ausgeführt'?'dpDoneGray':'dpAttention';
+            const undisposed=!o.driver||!o.vehicle||!o.seq;
+            const seqLabel=o.seq||'–',
+              driverLabel=o.driver||'Fahrer offen',
+              vehicleLabel=o.vehicle||'Fahrzeug offen',
+              mat=o.material?` · ${esc(o.material)}`:'';
+
+            return `<div class="card" onclick="openDetail(${o.id})" style="cursor:pointer"><div class="row"><div class="orderNo">${seqLabel}</div><div class="grow"><strong>${esc(c?.name||'')}</strong><div>${esc(s?.name||'')}</div><div class="small">${esc(o.task)} · ${esc(o.bin1||'')}${mat} · ${esc(vehicleLabel)} · ${esc(driverLabel)}</div>${undisposed?'<div class="small" style="color:#b45309;font-weight:700;margin-top:4px">noch nicht disponiert</div>':''}</div><span class="status ${cls}">${esc(o.status)}</span></div></div>`;
+          };
+
+          // Sofort beim Auswerten des Skripts scharf schalten.
+          // Die Funktion wartet selbständig, bis state geladen ist.
+          dpG3Schedule();
+          /* DP_G3_AUTOREFRESH_END */
+          """
+
+          text = text.replace(marker, patch + "\n" + marker, 1)
+          path.write_text(text, encoding="utf-8", newline="\n")
+          print("G3 Auto-Sync und Statusfarben wurden eingefügt.")
+          PY
+
+          grep -q "DP_G3_AUTOREFRESH_BEGIN" dispopilot-online-efd-base.html
+          grep -q "DP_G3_REFRESH_MS=60000" dispopilot-online-efd-base.html
+          grep -q "dpG3Schedule();" dispopilot-online-efd-base.html
+          grep -q "Auto-Sync prüft" dispopilot-online-efd-base.html
+          grep -q "Änderung übernommen" dispopilot-online-efd-base.html
+          grep -q "cache:'no-store'" dispopilot-online-efd-base.html
+          grep -q "dpStatusColorLogic" dispopilot-online-efd-base.html
+
+      - name: Apply A5 selectable bin type for Leeren and Abholen
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("dispopilot-online-efd-base.html")
+          text = path.read_text(encoding="utf-8")
+
+          marker = "/* DP13_PATCH_BEGIN */"
+          if text.count(marker) != 1:
+              raise SystemExit(f"A4 abgebrochen: DP13-Marker {text.count(marker)}x gefunden statt 1x.")
+
+          patch = r"""
+          /* DP_A5_LEEREN_ABHOLEN_MULDENTYP_BEGIN */
+
+          dpABRenderBinFields=function(order=null,forceOrder=false){
+            const host=$('dpABBinNumberFields');
+            if(!host)return;
+
+            if($('oBin1')?.parentElement)$('oBin1').parentElement.classList.add('hidden');
+            if($('bin2Field'))$('bin2Field').classList.add('hidden');
+            if($('bin3Field'))$('bin3Field').classList.add('hidden');
+            if($('standingBinField'))$('standingBinField').classList.add('hidden');
+            if($('newBinField'))$('newBinField').classList.add('hidden');
+
+            const n=Math.max(1,Math.min(10,Number($('oCount')?.value||1)));
+            const planned=dpA2OrderNumbers(order);
+            const oldPlanned=dpA2OldNumbers(order);
+            const types=dpA2Types(order);
+            const currentNums={},currentOld={},currentTypes={};
+
+            for(let i=1;i<=10;i++){
+              if($('oBinNumber'+i))currentNums[i]=$('oBinNumber'+i).value;
+              if($('oSwapOld'+i))currentOld[i]=$('oSwapOld'+i).value;
+              if($('oBinType'+i))currentTypes[i]=$('oBinType'+i).value;
+            }
+
+            let html='<div class="section" style="margin-top:4px">Mulden</div><div style="display:grid;gap:8px">';
+
+            for(let i=1;i<=n;i++){
+              const num=forceOrder?(planned[i-1]||''):(currentNums[i]??planned[i-1]??'');
+              const savedType=forceOrder?(types[i-1]||''):(currentTypes[i]??types[i-1]??'');
+              const typ=savedType||binByNumber(num)?.type||'';
+              const old=forceOrder?(oldPlanned[i-1]||''):(currentOld[i]??oldPlanned[i-1]??'');
+
+              html+='<div style="display:grid;grid-template-columns:minmax(64px,.55fr) minmax(120px,1fr) minmax(120px,1fr)'+(dpA2IsSwap()?' minmax(140px,1.1fr)':'')+';gap:8px;align-items:end;padding:9px;border:1px solid #e5e7eb;border-radius:10px;background:#f9fafb">';
+              html+='<div><strong>Mulde '+i+'</strong></div>';
+
+              if(dpA2ExistingOnly()){
+                html+='<div><label>Nummer</label><select id="oBinNumber'+i+'" onchange="dpA5ExistingChanged('+i+')">'+dpA2ExistingOptions(num)+'</select></div>';
+
+                if(['Leeren','Abholen'].includes(dpA2Task())){
+                  html+='<div><label>Typ</label><select id="oBinType'+i+'">'+dpA2TypeOptions(typ)+'</select></div>';
+                }else{
+                  html+='<div><label>Typ</label><div id="oExistingType'+i+'" style="min-height:42px;padding:10px;border:1px solid #d6dbe1;border-radius:9px;background:#fff">'+esc(dpA2AutoType(num))+'</div></div>';
+                }
+              }else{
+                html+='<div><label>Nummer</label><input id="oBinNumber'+i+'" inputmode="numeric" value="'+esc(num)+'" placeholder="Muldennummer"></div>';
+                html+='<div><label>Typ</label><select id="oBinType'+i+'">'+dpA2TypeOptions(typ||$('oBin1')?.value||'')+'</select></div>';
+              }
+
+              if(dpA2IsSwap()){
+                html+='<div><label>Abgeholte Nr.</label><select id="oSwapOld'+i+'" onchange="dpA2SyncType('+i+',true)">'+dpA2ExistingOptions(old)+'</select><div class="small" style="margin-top:4px">Typ: <span id="oSwapOldType'+i+'">'+esc(dpA2AutoType(old))+'</span></div></div>';
+              }
+
+              html+='</div>';
+            }
+
+            html+='</div>';
+            host.innerHTML=html;
+          };
+
+          function dpA5ExistingChanged(i){
+            const num=String($('oBinNumber'+i)?.value||'').trim();
+
+            if(['Leeren','Abholen'].includes(dpA2Task())){
+              const sel=$('oBinType'+i);
+              const stockType=binByNumber(num)?.type||'';
+              if(sel&&stockType&&Array.from(sel.options).some(o=>o.value===stockType)){
+                sel.value=stockType;
+              }
+            }else{
+              dpA2SyncType(i);
+            }
+          }
+
+          dpABCollectTypes=function(){
+            const nums=dpABCollectNumbers();
+            const out=[];
+
+            for(let i=1;i<=nums.length;i++){
+              if(['Leeren','Abholen'].includes(dpA2Task())){
+                out.push($('oBinType'+i)?.value||binByNumber(nums[i-1])?.type||'');
+              }else if(dpA2ExistingOnly()){
+                out.push(binByNumber(nums[i-1])?.type||'');
+              }else{
+                out.push($('oBinType'+i)?.value||'');
+              }
+            }
+
+            return out;
+          };
+
+          /* DP_A5_LEEREN_ABHOLEN_MULDENTYP_END */
+          """
+
+          text = text.replace(marker, patch + "\n" + marker, 1)
+          path.write_text(text, encoding="utf-8", newline="\n")
+          print("A5 Typauswahl bei Leeren und Abholen wurde eingefügt.")
+          PY
+
+          grep -q "DP_A5_LEEREN_ABHOLEN_MULDENTYP_BEGIN" dispopilot-online-efd-base.html
+          grep -q "dpA5ExistingChanged" dispopilot-online-efd-base.html
+
+      - name: Apply I targeted manual refresh
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("dispopilot-online-efd-base.html")
+          text = path.read_text(encoding="utf-8")
+
+          # E hatte den alten fehlerhaften srcdoc-Handler zunächst durch
+          # einen kompletten Seitenreload ersetzt. Nach G3 haben wir jetzt
+          # eine funktionierende gezielte DP_Data-Synchronisation.
+          old_btn = '<button class="btn secondary" type="button" onclick="window.location.reload()">Aktualisieren</button>'
+          new_btn = '<button class="btn secondary" type="button" onclick="dpG3Poll()">Aktualisieren</button>'
+
+          count = text.count(old_btn)
+          if count != 1:
+              raise SystemExit(
+                  f"I abgebrochen: Aktualisieren-Button {count}x gefunden statt genau 1x."
+              )
+
+          text = text.replace(old_btn, new_btn, 1)
+
+          marker = "/* DP13_PATCH_BEGIN */"
+          if text.count(marker) != 1:
+              raise SystemExit(
+                  f"I abgebrochen: DP13-Marker {text.count(marker)}x gefunden statt 1x."
+              )
+
+          patch = r"""
+          /* DP_I_AKTUALISIEREN_BEGIN */
+          // Punkt I:
+          // Der manuelle Aktualisieren-Button lädt nicht mehr die komplette
+          // SharePoint/srcdoc-Seite neu. Er verwendet direkt dieselbe
+          // bewährte zentrale DP_Data-Synchronisation wie G3.
+          // Dadurch bleiben Ansicht und App-Kontext erhalten.
+          /* DP_I_AKTUALISIEREN_END */
+          """
+
+          text = text.replace(marker, patch + "\n" + marker, 1)
+          path.write_text(text, encoding="utf-8", newline="\n")
+          print("I - gezieltes manuelles Aktualisieren wurde eingefügt.")
+          PY
+
+          grep -q 'onclick="dpG3Poll()">Aktualisieren</button>' dispopilot-online-efd-base.html
+          grep -q "DP_I_AKTUALISIEREN_BEGIN" dispopilot-online-efd-base.html
+
+      - name: Apply H mobile order and detail layout
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p=Path("dispopilot-online-efd-base.html")
+          t=p.read_text(encoding="utf-8")
+          marker="/* DP13_PATCH_BEGIN */"
+          if t.count(marker)!=1:
+              raise SystemExit(f"H abgebrochen: DP13-Marker {t.count(marker)}x gefunden statt 1x.")
+
+          patch=r"""
+          /* DP_H_MOBILE_AUFTRAGSANSICHT_BEGIN */
+          if(!document.getElementById('dpHMobileOrderStyle')){
+            const st=document.createElement('style');
+            st.id='dpHMobileOrderStyle';
+            st.textContent=`
+              #orderModal .box{width:min(1080px,calc(100vw - 24px));max-height:calc(100dvh - 24px)}
+              #detailModal .box{width:min(1000px,calc(100vw - 24px));max-height:calc(100dvh - 24px)}
+              #statusModal .box{width:min(940px,calc(100vw - 24px));max-height:calc(100dvh - 24px)}
+              #orderModal .box > .row:first-child,
+              #detailModal .box > .row:first-child,
+              #statusModal .box > .row:first-child{
+                position:sticky;top:-18px;z-index:8;background:#fff;
+                padding:12px 0 10px;border-bottom:1px solid #e5e7eb;margin-bottom:12px
+              }
+              #orderModal .box > .row:first-child .btn,
+              #detailModal .box > .row:first-child .btn,
+              #statusModal .box > .row:first-child .btn{min-width:92px}
+              #detailModal .grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+              @media(min-width:900px){
+                #detailModal .grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+              }
+              @media(max-width:760px){
+                #orderModal,#detailModal,#statusModal{align-items:stretch;padding:0}
+                #orderModal .box,#detailModal .box,#statusModal .box{
+                  width:100vw;height:100dvh;max-height:100dvh;border-radius:0;
+                  padding:12px;padding-top:max(12px,env(safe-area-inset-top));
+                  padding-bottom:max(16px,env(safe-area-inset-bottom));
+                  overflow-y:auto;overscroll-behavior:contain
+                }
+                #orderModal .box > .row:first-child,
+                #detailModal .box > .row:first-child,
+                #statusModal .box > .row:first-child{
+                  top:calc(-12px - env(safe-area-inset-top));margin:-12px -12px 12px;
+                  padding:max(12px,env(safe-area-inset-top)) 12px 10px
+                }
+                #orderModal .form,#statusModal .form{grid-template-columns:1fr;gap:10px}
+                #orderModal input,#orderModal select,#orderModal textarea,
+                #statusModal input,#statusModal select,#statusModal textarea{
+                  min-height:46px;font-size:16px
+                }
+                #orderModal textarea,#statusModal textarea{min-height:92px}
+                #dpABBinNumberFields > div[style*="display:grid"] > div{
+                  grid-template-columns:1fr !important
+                }
+                #detailModal .grid{grid-template-columns:1fr 1fr;gap:8px}
+                #detailModal .grid .btn{min-height:50px}
+                #detailModal .box > .row:last-child{gap:8px}
+                #detailModal .box > .row:last-child .btn{flex:1 1 145px}
+              }
+              @media(max-width:420px){
+                #detailModal .grid{grid-template-columns:1fr}
+              }
+            `;
+            document.head.appendChild(st);
+          }
+          /* DP_H_MOBILE_AUFTRAGSANSICHT_END */
+          """
+          t=t.replace(marker,patch+"\n"+marker,1)
+          p.write_text(t,encoding="utf-8",newline="\n")
+          print("H eingefügt.")
+          PY
+
+          grep -q "DP_H_MOBILE_AUFTRAGSANSICHT_BEGIN" dispopilot-online-efd-base.html
+          grep -q "dpHMobileOrderStyle" dispopilot-online-efd-base.html
+          grep -q "height:100dvh" dispopilot-online-efd-base.html
+      - name: Apply K1 billing and site address logic
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p=Path("dispopilot-online-efd-base.html")
+          t=p.read_text(encoding="utf-8")
+
+          # 1) Separaten STORNIEREN-Button entfernen.
+          storn_pattern=re.compile(
+              r"<button\s+class=\"btn danger\"\s+type=\"button\"\s+onclick=\"setStatus\('Storniert'\)\">STORNIEREN</button>"
+          )
+          t,n=storn_pattern.subn("",t,count=1)
+          if n!=1:
+              raise SystemExit(f"K1 abgebrochen: STORNIEREN-Button {n}x gefunden statt 1x.")
+
+          # 2) "Nicht ausgeführt" ist ein abschließender/stornierter Fall.
+          old_archive="if(['Ausgeführt','Storniert'].includes(pendingStatus)&&!o.archivedAt)"
+          new_archive="if(['Ausgeführt','Nicht ausgeführt','Storniert'].includes(pendingStatus)&&!o.archivedAt)"
+          if t.count(old_archive)!=1:
+              raise SystemExit(
+                  f"K1 abgebrochen: Archiv-Bedingung {t.count(old_archive)}x gefunden statt 1x."
+              )
+          t=t.replace(old_archive,new_archive,1)
+
+          marker="/* DP13_PATCH_BEGIN */"
+          if t.count(marker)!=1:
+              raise SystemExit(
+                  f"K1 abgebrochen: DP13-Marker {t.count(marker)}x gefunden statt 1x."
+              )
+
+          patch=r"""
+          /* DP_K1_ADRESSEN_BEGIN */
+
+          function dpK1Norm(v){return String(v||'').trim()}
+          function dpK1HasBilling(c){
+            return !!c && [c.street,c.zip,c.city].some(v=>dpK1Norm(v));
+          }
+          function dpK1SameAddress(a,b){
+            if(!a||!b)return false;
+            return dpK1Norm(a.street)===dpK1Norm(b.street)
+              && dpK1Norm(a.zip)===dpK1Norm(b.zip)
+              && dpK1Norm(a.city)===dpK1Norm(b.city);
+          }
+          function dpK1AddressHtml(x){
+            if(!x)return '';
+            const line1=dpK1Norm(x.street);
+            const line2=[dpK1Norm(x.zip),dpK1Norm(x.city)].filter(Boolean).join(' ');
+            const line3=dpK1Norm(x.extra);
+            return [line1,line2,line3].filter(Boolean).map(v=>esc(v)).join('<br>');
+          }
+
+          function dpK1SelectedSiteCustomer(){
+            const cid=+$('sCustomer')?.value;
+            return customer(cid);
+          }
+
+          function dpK1SiteCustomerChanged(){
+            const cb=$('sSameBilling');
+            if(cb?.checked && !dpK1HasBilling(dpK1SelectedSiteCustomer())){
+              cb.checked=false;
+            }
+            dpK1SameBillingChanged();
+          }
+
+          function dpK1SameBillingChanged(){
+            const cb=$('sSameBilling');
+            if(!cb)return;
+
+            const c=dpK1SelectedSiteCustomer();
+            if(cb.checked && !dpK1HasBilling(c)){
+              cb.checked=false;
+            }
+
+            const same=cb.checked;
+            ['sStreetWrap','sZipWrap','sCityWrap'].forEach(id=>{
+              const el=$(id);
+              if(el)el.classList.toggle('hidden',same);
+            });
+
+            const preview=$('sBillingPreview');
+            if(same){
+              $('sStreet').value=dpK1Norm(c?.street);
+              $('sZip').value=dpK1Norm(c?.zip);
+              $('sCity').value=dpK1Norm(c?.city);
+              if(preview){
+                preview.classList.remove('hidden');
+                preview.innerHTML='<strong>Übernommene Baustellenadresse</strong><br>'
+                  +(dpK1AddressHtml(c)||'<span class="small">Keine Rechnungsadresse hinterlegt.</span>');
+              }
+            }else if(preview){
+              preview.classList.add('hidden');
+              preview.innerHTML='';
+            }
+          }
+
+          function dpK1OrderAddress(){
+            const out=$('dpK1OrderAddress');
+            if(!out)return;
+            const s=site($('oSite')?.value);
+            const html=dpK1AddressHtml(s);
+            if(!s||!html){
+              out.classList.add('hidden');
+              out.innerHTML='';
+              return;
+            }
+            out.classList.remove('hidden');
+            out.innerHTML='<strong>Baustellenadresse</strong><div style="margin-top:4px">'+html+'</div>';
+          }
+
+          function dpK1InstallAddressUi(){
+            const cStreet=$('cStreet');
+            if(cStreet){
+              const lab=cStreet.parentElement?.querySelector('label');
+              if(lab)lab.textContent='Straße / Hausnr. – Rechnungsadresse';
+            }
+            const cZip=$('cZip');
+            if(cZip){
+              const lab=cZip.parentElement?.querySelector('label');
+              if(lab)lab.textContent='PLZ – Rechnungsadresse';
+            }
+            const cCity=$('cCity');
+            if(cCity){
+              const lab=cCity.parentElement?.querySelector('label');
+              if(lab)lab.textContent='Ort – Rechnungsadresse';
+            }
+
+            const sStreet=$('sStreet'),sZip=$('sZip'),sCity=$('sCity');
+            if(sStreet&&!$('sSameBilling')){
+              sStreet.parentElement.id='sStreetWrap';
+              sZip.parentElement.id='sZipWrap';
+              sCity.parentElement.id='sCityWrap';
+
+              const sameRow=document.createElement('div');
+              sameRow.id='sSameBillingRow';
+              sameRow.style.gridColumn='1 / -1';
+              sameRow.innerHTML=
+                '<label class="switchline" style="margin:0">'
+                +'<input id="sSameBilling" type="checkbox"> '
+                +'<span><strong>Baustellenadresse = Rechnungsadresse</strong>'
+                +'<span class="small" style="display:block">Adresse des ausgewählten Kunden übernehmen</span></span>'
+                +'</label>'
+                +'<div id="sBillingPreview" class="oknotice hidden" style="margin-top:8px"></div>';
+
+              sStreet.parentElement.before(sameRow);
+              $('sSameBilling').addEventListener('change',dpK1SameBillingChanged);
+              $('sCustomer')?.addEventListener('change',dpK1SiteCustomerChanged);
+            }
+
+            const oSite=$('oSite');
+            if(oSite&&!$('dpK1OrderAddress')){
+              const outer=oSite.closest('.row')?.parentElement;
+              if(outer){
+                const address=document.createElement('div');
+                address.id='dpK1OrderAddress';
+                address.className='oknotice hidden';
+                address.style.gridColumn='1 / -1';
+                outer.after(address);
+              }
+              oSite.addEventListener('change',dpK1OrderAddress);
+              $('oCustomer')?.addEventListener('change',()=>setTimeout(dpK1OrderAddress,0));
+            }
+          }
+
+          dpK1InstallAddressUi();
+
+          openSite=function(id=null,fromOrder=false){
+            editingSiteId=id;
+            returnToOrder=fromOrder;
+            refreshCustomerSelects();
+
+            if(id){
+              const s=site(id);
+              $('siteModalTitle').textContent='Baustelle bearbeiten';
+              $('sCustomer').value=s.customerId??s.cid;
+              $('sName').value=s.name;
+              $('sCode').value=s.code||'';
+              $('sStreet').value=s.street||'';
+              $('sZip').value=s.zip||'';
+              $('sCity').value=s.city||'';
+              $('sExtra').value=s.extra||'';
+
+              const c=customer(s.customerId??s.cid);
+              $('sSameBilling').checked=dpK1HasBilling(c)&&dpK1SameAddress(s,c);
+            }else{
+              $('siteModalTitle').textContent='Neue Baustelle';
+              $('sCustomer').value=fromOrder?$('oCustomer').value:(state.customers[0]?.id||'');
+              ['sName','sCode','sStreet','sZip','sCity','sExtra'].forEach(x=>$(x).value='');
+
+              const c=dpK1SelectedSiteCustomer();
+              $('sSameBilling').checked=dpK1HasBilling(c);
+            }
+
+            dpK1SameBillingChanged();
+            openM('siteModal');
+          };
+
+          saveSite=async function(){
+            const name=$('sName').value.trim();
+            if(!name)return alert('Bitte Baustelle eingeben.');
+
+            const customerId=+$('sCustomer').value;
+            const c=customer(customerId);
+            const same=!!$('sSameBilling')?.checked;
+
+            if(same&&!dpK1HasBilling(c)){
+              return alert('Beim Kunden ist noch keine Rechnungsadresse hinterlegt.');
+            }
+
+            const code=($('sCode').value.trim()
+              ||name.replace(/[^\p{L}\p{N}]/gu,'').slice(0,8)).toUpperCase();
+
+            const street=same?dpK1Norm(c?.street):$('sStreet').value.trim();
+            const zip=same?dpK1Norm(c?.zip):$('sZip').value.trim();
+            const city=same?dpK1Norm(c?.city):$('sCity').value.trim();
+
+            let id=editingSiteId;
+            const data={
+              customerId,name,code,street,zip,city,
+              extra:$('sExtra').value.trim()
+            };
+
+            if(id)Object.assign(site(id),data);
+            else{
+              id=uid();
+              state.sites.push({id,...data});
+            }
+
+            await persist();
+            closeM('siteModal');
+            renderSites();
+            refreshOrderSites();
+
+            if(returnToOrder){
+              $('oCustomer').value=customerId;
+              refreshOrderSites();
+              $('oSite').value=id;
+              dpK1OrderAddress();
+              openM('orderModal');
+            }
+          };
+
+          const dpK1BaseRefreshOrderSites=refreshOrderSites;
+          refreshOrderSites=function(){
+            const r=dpK1BaseRefreshOrderSites.apply(this,arguments);
+            setTimeout(dpK1OrderAddress,0);
+            return r;
+          };
+
+          const dpK1BaseOpenDetail=openDetail;
+          openDetail=function(id){
+            const r=dpK1BaseOpenDetail.apply(this,arguments);
+            const o=orderById(id);
+            const s=site(o?.siteId);
+            const html=dpK1AddressHtml(s);
+            const body=$('detailBody');
+
+            if(body&&html&&!body.querySelector('.dpK1SiteAddressCard')){
+              const card=document.createElement('div');
+              card.className='card dpK1SiteAddressCard';
+              card.innerHTML='<strong>Baustellenadresse</strong>'
+                +'<div style="margin-top:5px">'+html+'</div>';
+              body.prepend(card);
+            }
+            return r;
+          };
+
+          /* DP_K1_ADRESSEN_END */
+          """
+
+          t=t.replace(marker,patch+"\n"+marker,1)
+          p.write_text(t,encoding="utf-8",newline="\n")
+          print("K1 Adressen + Entfernen STORNIEREN eingefügt.")
+          PY
+
+          grep -q "DP_K1_ADRESSEN_BEGIN" dispopilot-online-efd-base.html
+          grep -q "Baustellenadresse = Rechnungsadresse" dispopilot-online-efd-base.html
+          grep -q "dpK1OrderAddress" dispopilot-online-efd-base.html
+          grep -q "Straße / Hausnr. – Rechnungsadresse" dispopilot-online-efd-base.html
+          grep -q "Nicht ausgeführt','Storniert" dispopilot-online-efd-base.html
+          if grep -q ">STORNIEREN</button>" dispopilot-online-efd-base.html; then
+            echo "Fehler: STORNIEREN-Button ist noch vorhanden."
+            exit 1
+          fi
+
+      - name: Apply DP Users authentication patch
+        run: |
+          python3 patch-dp-users-v2.py \
+            --input dispopilot-online-efd-base.html \
+            --output dispopilot-online-efd.html
+
+          grep -q "DISPOPILOT_DP_USERS_AUTH_V2" dispopilot-online-efd.html
+          grep -q "DP_Users" dispopilot-online-efd.html
+          grep -q "DP_D_FAHRFOLGE_BEGIN" dispopilot-online-efd.html
+          grep -q 'onclick="dpG3Poll()">Aktualisieren</button>' dispopilot-online-efd.html
+          grep -q "n.acknowledgedAt=nowIso()" dispopilot-online-efd.html
+
+      - name: Install SPFx CLI
+        run: npm install -g @microsoft/spfx-cli@latest
+
+      - name: Scaffold SPFx web part
+        run: |
+          rm -rf spfx-build
+          spfx create \
+            --template webpart-noframework \
+            --library-name dispopilot-online-v13 \
+            --component-name "DispoPilot Online" \
+            --component-alias DispoPilotOnline \
+            --component-description "DispoPilot Online V1.3" \
+            --solution-name dispopilot-online-v13 \
+            --target-dir spfx-build \
+            --package-manager npm
+
+      - name: Insert patched runtime
+        run: |
+          python3 prepare-spfx-final.py \
+            --app dispopilot-online-efd.html \
+            --project spfx-build
+
+      - name: Configure SiteAssets hosting
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          package = Path('spfx-build/config/package-solution.json')
+          pdata = json.loads(package.read_text(encoding='utf-8'))
+          solution = pdata['solution']
+          solution['version'] = '1.3.5.16'
+          solution['includeClientSideAssets'] = False
+          solution['skipFeatureDeployment'] = True
+          package.write_text(json.dumps(pdata, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+          wm_path = Path('spfx-build/config/write-manifests.json')
+          wm = {
+            '$schema': 'https://developer.microsoft.com/json-schemas/spfx-build/write-manifests.schema.json',
+            'cdnBasePath': 'https://ralphyourway.sharepoint.com/sites/DispoPilot/SiteAssets/DispoPilotAssets'
+          }
+          wm_path.write_text(json.dumps(wm, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+          manifests = list(Path('spfx-build/src/webparts').rglob('*.manifest.json'))
+          if not manifests:
+              raise SystemExit('Kein Webpart-Manifest gefunden.')
+
+          for manifest in manifests:
+              data = json.loads(manifest.read_text(encoding='utf-8'))
+              hosts = data.setdefault('supportedHosts', [])
+              for host in ('SharePointWebPart', 'SharePointFullPage'):
+                  if host not in hosts:
+                      hosts.append(host)
+              manifest.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          PY
+
+      - name: Verify configuration
+        run: |
+          grep -q '"includeClientSideAssets": false' spfx-build/config/package-solution.json
+          grep -q '"version": "1.3.5.16"' spfx-build/config/package-solution.json
+          grep -q 'SiteAssets/DispoPilotAssets' spfx-build/config/write-manifests.json
+          grep -R '"SharePointFullPage"' spfx-build/src/webparts
+          grep -R 'DP_Users' spfx-build/src/webparts
+          grep -R 'DP_D_FAHRFOLGE_BEGIN' spfx-build/src/webparts
+          grep -R 'n.acknowledgedAt=nowIso()' spfx-build/src/webparts
+          grep -R 'DP_A2_MEHRMULDEN_BEGIN' spfx-build/src/webparts
+          grep -R 'DP_A3_FAHRERBESTAETIGUNG_BEGIN' spfx-build/src/webparts
+          grep -R 'DP_G3_AUTOREFRESH_BEGIN' spfx-build/src/webparts
+          grep -R 'DP_A5_LEEREN_ABHOLEN_MULDENTYP_BEGIN' spfx-build/src/webparts
+          grep -R 'DP_I_AKTUALISIEREN_BEGIN' spfx-build/src/webparts
+          grep -R 'DP_H_MOBILE_AUFTRAGSANSICHT_BEGIN' spfx-build/src/webparts
+          grep -R 'DP_K1_ADRESSEN_BEGIN' spfx-build/src/webparts
+          grep -R 'dpG3Poll' spfx-build/src/webparts
+          grep -R 'Aktualisieren' spfx-build/src/webparts
+          grep -R 'dpStatusColorLogic' spfx-build/src/webparts
+
+      - name: Build production bundle
+        working-directory: spfx-build
+        run: npx heft build --production
+
+      - name: Package SharePoint solution
+        working-directory: spfx-build
+        run: npx heft package-solution --production
+
+      - name: Collect SiteAssets and package
+        run: |
+          set -e
+          rm -rf artifact
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS
+          mkdir -p artifact/UPLOAD_TO_APP_CATALOG
+
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n 1)
+          test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          if [ -d "spfx-build/release/assets" ]; then
+            cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d "spfx-build/temp/deploy" ]; then
+            cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else
+            echo "Keine SPFx Asset-Ausgabe gefunden."
+            exit 1
+          fi
+
+          test "$(find artifact/UPLOAD_TO_SITEASSETS -type f | wc -l)" -gt 0
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DispoPilot V1.3 - K1 Adressen - Paketrevision 1.3.5.16
+
+          Enthalten bleibt der gesamte bisherige Stand:
+          A/A2/A3/A5/B, D, E/F, G3, H, I und Statusfarben.
+
+          K1 - Adressen:
+          - Kundenadresse = Rechnungsadresse.
+          - Baustellenadresse = für Fahrer relevante Liefer-/Einsatzadresse.
+          - Bei der Baustellenanlage:
+            "Baustellenadresse = Rechnungsadresse".
+          - Mit Haken werden Straße, PLZ und Ort vom Kunden übernommen.
+          - Die übernommenen Werte werden trotzdem separat in der Baustelle gespeichert.
+          - Ohne Haken wird eine eigene Baustellenadresse eingegeben.
+          - Zusatz bleibt baustellenspezifisch möglich.
+          - Im Auftrag und im Auftragsdetail wird die Baustellenadresse angezeigt.
+
+          STATUS-VEREINFACHUNG:
+          - Separater Button "STORNIEREN" entfernt.
+          - "NICHT AUSGEFÜHRT" ist nun ebenfalls abschließend und wird archiviert.
+          - Grund / Abweichung und Bemerkung bleiben zur Erklärung erhalten.
+          - Alte vorhandene "Storniert"-Daten bleiben kompatibel.
+
+          TEST:
+          1. Kunde mit Rechnungsadresse anlegen/öffnen.
+          2. Neue Baustelle anlegen und Haken testen.
+          3. Haken entfernen und eigene Baustellenadresse speichern.
+          4. Auftrag mit Baustelle öffnen: Adresse muss sichtbar sein.
+          5. Fahrer-Auftragsdetail öffnen: Baustellenadresse muss sichtbar sein.
+          6. STORNIEREN-Button muss weg sein.
+          7. NICHT AUSGEFÜHRT mit Grund/Bemerkung speichern:
+             Auftrag muss als abgeschlossener Fall behandelt/archiviert werden.
+
+          Zurückgestellt:
+          C - Rollen/Ansichten/Berechtigungen
+          J - Wisch-/Zurücknavigation / PWA
+          K2 - erweiterte Standort-/Navigationsfunktionen (optional)
+
+          Danach:
+          L - Material/Abladeort
+          M - Materialanlieferung / beladene Mulde zum Kunden
+          TXT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: K1-ADRESSEN-DISPOPILOT
+          path: artifact/
+          if-no-files-found: error
