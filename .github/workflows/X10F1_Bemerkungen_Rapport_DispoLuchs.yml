@@ -1,0 +1,604 @@
+name: X10F1 BEMERKUNGEN + RAPPORT TRENNUNG DispoLuchs V1.3.5.63
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Install workflow parser
+        run: python3 -m pip install --quiet pyyaml
+
+      - name: Prepare X9D replay helper
+        run: |
+          cat > .x10-replay-x9d.py <<'PY'
+          from pathlib import Path
+          import os
+          import subprocess
+          import sys
+          import yaml
+
+          WORKFLOW_DIR = Path('.github/workflows')
+          candidates = []
+          for p in list(WORKFLOW_DIR.glob('*.yml')) + list(WORKFLOW_DIR.glob('*.yaml')):
+              if p.name == Path(__file__).name:
+                  continue
+              try:
+                  text = p.read_text(encoding='utf-8')
+              except Exception:
+                  continue
+              # Nur echte X9D-Dateien als Basis zulassen. X10 selbst erwähnt
+              # X9D im Inhalt und darf deshalb niemals versehentlich sich selbst replayen.
+              if 'x9d' not in p.name.lower():
+                  continue
+              low = (p.name + '\n' + text[:4000]).lower()
+              score = 0
+              if '1.3.5.62' in text:
+                  score += 20
+              if 'sass-embedded-linux-x64' in text:
+                  score += 20
+              if 'neuer auftrag' in low:
+                  score += 10
+              if 'sass' in low:
+                  score += 5
+              candidates.append((score, p, text))
+
+          if not candidates:
+              raise SystemExit(
+                  'X10 abgebrochen: Kein X9D-Workflow in .github/workflows gefunden. '
+                  'Benötigt wird der bereits erfolgreich verwendete X9D/1.3.5.62-Workflow.'
+              )
+
+          candidates.sort(key=lambda x: (x[0], x[1].stat().st_mtime), reverse=True)
+          score, workflow_path, workflow_text = candidates[0]
+          if '1.3.5.62' not in workflow_text:
+              raise SystemExit(
+                  f'X10 abgebrochen: Gefundener X9D-Workflow {workflow_path} enthält nicht Version 1.3.5.62.'
+              )
+
+          doc = yaml.safe_load(workflow_text)
+          try:
+              steps = doc['jobs']['build']['steps']
+          except Exception as e:
+              raise SystemExit(f'X10 abgebrochen: X9D-Schritte konnten nicht gelesen werden: {e}')
+
+          def run_text(step):
+              return str(step.get('run') or '')
+
+          def step_name(step):
+              return str(step.get('name') or '')
+
+          install_idx = next((i for i, s in enumerate(steps)
+                              if 'install spfx cli' in step_name(s).lower()
+                              or 'npm install -g @microsoft/spfx-cli' in run_text(s)), None)
+          build_idx = next((i for i, s in enumerate(steps)
+                            if 'build production bundle' in step_name(s).lower()
+                            or 'heft build --production' in run_text(s)), None)
+
+          if install_idx is None or build_idx is None or build_idx <= install_idx:
+              raise SystemExit(
+                  f'X10 abgebrochen: X9D-Grenzen nicht eindeutig erkannt '
+                  f'(Install={install_idx}, Build={build_idx}).'
+              )
+
+          phase = sys.argv[1] if len(sys.argv) > 1 else ''
+          if phase == 'pre':
+              selected = steps[:install_idx]
+          elif phase == 'spfx':
+              selected = steps[install_idx:build_idx]
+          elif phase == 'build':
+              selected = steps[build_idx:]
+          else:
+              raise SystemExit('Phase muss pre, spfx oder build sein.')
+
+          allowed_uses = (
+              'actions/checkout@',
+              'actions/setup-node@',
+              'actions/upload-artifact@',
+          )
+
+          print(f'X10 verwendet als Basis: {workflow_path} (Score {score})')
+          print(f'X9D Schritte gesamt: {len(steps)} | Install-SPFx: {install_idx} | Build: {build_idx}')
+
+          for idx, step in enumerate(selected, 1):
+              name = step_name(step) or f'Schritt {idx}'
+              uses = str(step.get('uses') or '')
+              command = run_text(step)
+
+              if uses:
+                  if not uses.startswith(allowed_uses):
+                      raise SystemExit(
+                          f'X10 abgebrochen: X9D enthält einen nicht automatisch replaybaren uses-Schritt: '
+                          f'{name} -> {uses}'
+                      )
+                  print(f'-- übersprungen (X10 übernimmt selbst): {name} [{uses}]')
+                  continue
+
+              if not command.strip():
+                  print(f'-- ohne run, übersprungen: {name}')
+                  continue
+
+              shell = str(step.get('shell') or 'bash').lower()
+              if shell not in ('bash', 'sh'):
+                  raise SystemExit(f'X10 abgebrochen: Nicht unterstützte Shell in X9D: {name} -> {shell}')
+
+              cwd_raw = str(step.get('working-directory') or '.').strip()
+              expr_open = '$' + '{{'
+              if expr_open in cwd_raw:
+                  raise SystemExit(f'X10 abgebrochen: Dynamisches working-directory in X9D nicht unterstützt: {name}')
+              cwd = Path(cwd_raw)
+              if not cwd.exists():
+                  raise SystemExit(f'X10 abgebrochen: Arbeitsverzeichnis für {name} fehlt: {cwd}')
+
+              env = os.environ.copy()
+              for k, v in (step.get('env') or {}).items():
+                  sv = str(v)
+                  if expr_open in sv:
+                      raise SystemExit(f'X10 abgebrochen: Dynamische env-Expression in X9D nicht unterstützt: {name}/{k}')
+                  env[str(k)] = sv
+
+              print(f'\n===== X9D REPLAY: {name} =====')
+              subprocess.run(
+                  ['bash', '-eo', 'pipefail', '-c', command],
+                  cwd=str(cwd),
+                  env=env,
+                  check=True,
+              )
+          PY
+
+      - name: Replay X9D through patched runtime
+        run: python3 .x10-replay-x9d.py pre
+
+      - name: Apply X10 remarks and rapport separation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('dispopilot-online-efd.html')
+          if not p.exists():
+              raise SystemExit('X10 abgebrochen: dispopilot-online-efd.html wurde von X9D nicht erzeugt.')
+
+          t = p.read_text(encoding='utf-8')
+          marker = '/* DP13_PATCH_END */'
+          if t.count(marker) != 1:
+              raise SystemExit(f'X10 abgebrochen: DP13-Endmarker {t.count(marker)}x gefunden statt 1x.')
+          if 'DP_X10_BEMERKUNGEN_RAPPORT_BEGIN' in t:
+              raise SystemExit('X10 abgebrochen: Patch bereits vorhanden.')
+
+          patch = r'''
+          /* DP_X10_BEMERKUNGEN_RAPPORT_BEGIN */
+          // X10 trennt operative Hinweise, interne Kundeninformationen und
+          // die Rapport-/Abschlussbemerkung konsequent voneinander.
+
+          function dpX10Text(v){return String(v??'').trim();}
+          function dpX10Own(obj,key){return !!obj&&Object.prototype.hasOwnProperty.call(obj,key);}
+          function dpX10PlanningNote(o){
+            if(!o)return '';
+            if(dpX10Own(o,'planningNote'))return dpX10Text(o.planningNote||'');
+            // Bei Altaufträgen, die bereits vor X10 ausgeführt wurden, ist o.note
+            // nach der alten Logik die damalige Abschluss-/Rapportbemerkung. Die
+            // ursprüngliche Planungsbemerkung lässt sich dort nicht sicher rekonstruieren.
+            if(String(o.status||'')==='Ausgeführt')return '';
+            return dpX10Text(o.note||'');
+          }
+          function dpX10CompletionNote(o){
+            if(!o)return '';
+            if(dpX10Own(o,'completionNote'))return dpX10Text(o.completionNote||'');
+            // Historische, bereits vor X10 ausgeführte Aufträge behalten ihren
+            // bisherigen Rapportinhalt. Für noch nicht ausgeführte Aufträge wird
+            // dagegen niemals die Planungsbemerkung als Abschlussbemerkung benutzt.
+            return String(o.status||'')==='Ausgeführt'?dpX10Text(o.note||''):'';
+          }
+
+          // ------------------------------------------------------------
+          // 1) KUNDE: Allgemeine Bemerkung + Interne Bemerkung / nur Büro
+          // ------------------------------------------------------------
+          function dpX10InstallCustomerNotes(){
+            const modal=$('customerModal');
+            if(!modal||$('dpX10CustomerNotes'))return;
+            const saveBtn=Array.from(modal.querySelectorAll('button')).find(
+              b=>String(b.textContent||'').trim()==='Speichern'
+            );
+            if(!saveBtn)return;
+
+            const wrap=document.createElement('div');
+            wrap.id='dpX10CustomerNotes';
+            wrap.style.marginTop='12px';
+            wrap.innerHTML=
+              '<div style="margin-bottom:10px">'
+              +'<label>Allgemeine Bemerkung</label>'
+              +'<textarea id="cGeneralNote" placeholder="z. B. Kunde vorher telefonisch avisieren"></textarea>'
+              +'<div class="small" style="margin-top:4px">Operativer Hinweis – darf dem Fahrer beim Auftrag angezeigt werden.</div>'
+              +'</div>'
+              +'<div>'
+              +'<label>Interne Bemerkung / nur Büro</label>'
+              +'<textarea id="cOfficeNote" placeholder="z. B. nur gegen Vorkasse"></textarea>'
+              +'<div class="small" style="margin-top:4px"><strong>Nur Büro/Disposition.</strong> Wird niemals in der Fahreransicht angezeigt.</div>'
+              +'</div>';
+            saveBtn.before(wrap);
+          }
+
+          const dpX10BaseOpenCustomer=openCustomer;
+          openCustomer=function(id=null){
+            dpX10InstallCustomerNotes();
+            const r=dpX10BaseOpenCustomer.apply(this,arguments);
+            const c=id?customer(id):null;
+            if($('cGeneralNote'))$('cGeneralNote').value=c?.generalNote||'';
+            if($('cOfficeNote')){
+              // Datenschutzfreundliche Migration: Ein eventuell vorhandenes altes,
+              // nicht klassifiziertes Kunden-note wird NIE automatisch Fahrerhinweis.
+              // Es erscheint zunächst nur im internen Bürofeld.
+              $('cOfficeNote').value=c
+                ?(dpX10Own(c,'officeNote')?(c.officeNote||''):(c.note||''))
+                :'';
+            }
+            return r;
+          };
+
+          const dpX10BaseSaveCustomer=saveCustomer;
+          saveCustomer=async function(){
+            dpX10InstallCustomerNotes();
+            const editId=editingCustomerId;
+            const before=new Set((state.customers||[]).map(c=>String(c.id)));
+            const general=dpX10Text($('cGeneralNote')?.value||'');
+            const office=dpX10Text($('cOfficeNote')?.value||'');
+            const r=await dpX10BaseSaveCustomer.apply(this,arguments);
+            const saved=editId?customer(editId):(state.customers||[]).find(c=>!before.has(String(c.id)));
+            if(saved){
+              saved.generalNote=general;
+              saved.officeNote=office;
+              saved.updatedAt=nowIso();
+              await persist();
+            }
+            return r;
+          };
+
+          // ------------------------------------------------------------
+          // 2) BAUSTELLE: eigener Fahrer-/Auftragshinweis
+          // ------------------------------------------------------------
+          function dpX10InstallSiteNote(){
+            const modal=$('siteModal');
+            if(!modal||$('dpX10SiteNote'))return;
+            const saveBtn=Array.from(modal.querySelectorAll('button')).find(
+              b=>String(b.textContent||'').trim()==='Speichern'
+            );
+            if(!saveBtn)return;
+            const wrap=document.createElement('div');
+            wrap.id='dpX10SiteNote';
+            wrap.style.marginTop='12px';
+            wrap.innerHTML=
+              '<label>Bemerkung / Fahrerhinweis</label>'
+              +'<textarea id="sNote" placeholder="z. B. Zufahrt über Tor 3"></textarea>'
+              +'<div class="small" style="margin-top:4px">Wird bei Aufträgen dieser Baustelle im gemeinsamen Hinweisfeld angezeigt.</div>';
+            saveBtn.before(wrap);
+          }
+
+          const dpX10BaseOpenSite=openSite;
+          openSite=function(id=null){
+            dpX10InstallSiteNote();
+            const r=dpX10BaseOpenSite.apply(this,arguments);
+            const s=id?site(id):null;
+            if($('sNote'))$('sNote').value=s?.note||'';
+            return r;
+          };
+
+          const dpX10BaseSaveSite=saveSite;
+          saveSite=async function(){
+            dpX10InstallSiteNote();
+            const editId=editingSiteId;
+            const before=new Set((state.sites||[]).map(s=>String(s.id)));
+            const note=dpX10Text($('sNote')?.value||'');
+            const r=await dpX10BaseSaveSite.apply(this,arguments);
+            const saved=editId?site(editId):(state.sites||[]).find(s=>!before.has(String(s.id)));
+            if(saved){
+              saved.note=note;
+              saved.updatedAt=nowIso();
+              await persist();
+            }
+            return r;
+          };
+
+          // ------------------------------------------------------------
+          // 3) FAHRER-/AUSFÜHRUNGSANSICHT: EIN gemeinsamer Hinweis-Kasten
+          // ------------------------------------------------------------
+          function dpX10OrderBinNumbers(o){
+            const all=[];
+            const add=v=>{
+              if(Array.isArray(v)){v.forEach(add);return;}
+              dpX10Text(v).split(/[;,/]+/).forEach(part=>{
+                const raw=dpX10Text(part);
+                if(!raw)return;
+                const found=typeof parsedBinNumbers==='function'?parsedBinNumbers(raw):[];
+                if(found.length)found.forEach(n=>all.push(String(n)));
+                else if(/^\d+[A-Za-z]?$/.test(raw))all.push(raw);
+              });
+            };
+            add(o?.actualBinNumbers);
+            add(o?.actualExistingBinNumbers);
+            add(o?.newBinNumbers);
+            add(o?.existingBinNumbers);
+            add(o?.binNumbers);
+            add(o?.newBinNumber);
+            add(o?.existingBinNumber);
+            return [...new Set(all.map(String).filter(Boolean))];
+          }
+
+          function dpX10Entries(o){
+            const out=[];
+            const push=(label,value)=>{
+              const text=dpX10Text(value);
+              if(text)out.push({label,text});
+            };
+            const c=o?customer(o.customerId):null;
+            const s=o?site(o.siteId):null;
+
+            push('Auftrag',dpX10PlanningNote(o));
+            push('Baustelle',s?.note||'');
+            // Absichtlich ausschließlich generalNote. officeNote und ein altes
+            // unspezifiziertes c.note sind für Fahrer tabu.
+            push('Kunde',c?.generalNote||'');
+
+            dpX10OrderBinNumbers(o).forEach(number=>{
+              const b=typeof binByNumber==='function'?binByNumber(number):null;
+              push('Mulde '+number,b?.note||'');
+            });
+            return out;
+          }
+
+          function dpX10RenderDriverNotes(orderId){
+            const body=$('detailBody');
+            const o=orderById(orderId);
+            if(!body||!o)return;
+            body.querySelector('.dpX10NotesCard')?.remove();
+
+            const entries=dpX10Entries(o);
+            if(!entries.length)return;
+
+            const card=document.createElement('div');
+            card.className='card dpX10NotesCard';
+            card.style.marginBottom='10px';
+            card.innerHTML=
+              '<strong>Bemerkungen / Hinweise</strong>'
+              +'<div style="margin-top:7px;display:grid;gap:6px">'
+              +entries.map(x=>
+                '<div><strong>'+esc(x.label)+':</strong> '+esc(x.text)+'</div>'
+              ).join('')
+              +'</div>';
+
+            const address=body.querySelector('.dpK1BAddressButtonCard,.dpK1SiteAddressCard');
+            if(address)address.after(card);else body.prepend(card);
+          }
+
+          const dpX10BaseOpenDetail=openDetail;
+          openDetail=function(id){
+            const r=dpX10BaseOpenDetail.apply(this,arguments);
+            setTimeout(()=>dpX10RenderDriverNotes(id),0);
+            return r;
+          };
+
+          // ------------------------------------------------------------
+          // 4) ABSCHLUSSBEMERKUNG: eigenes Feld statt o.note zu überschreiben
+          // ------------------------------------------------------------
+          const dpX10BaseSetStatus=setStatus;
+          setStatus=function(s){
+            const r=dpX10BaseSetStatus.apply(this,arguments);
+            const o=orderById(currentOrderId);
+            if(s==='Ausgeführt'&&o&&$('statusNote')){
+              // Erst beim Auftrag abschließen ist dies die Rapportbemerkung.
+              $('statusNote').value=dpX10CompletionNote(o);
+              const label=$('statusNote')?.previousElementSibling;
+              if(label&&label.tagName==='LABEL')label.textContent='Bemerkung zum Abschluss / Rapport';
+            }
+            return r;
+          };
+
+          const dpX10BaseConfirmStatus=confirmStatus;
+          confirmStatus=async function(){
+            const o=orderById(currentOrderId);
+            const isCompletion=String(pendingStatus||'')==='Ausgeführt';
+            if(!o||!isCompletion)return await dpX10BaseConfirmStatus.apply(this,arguments);
+
+            // Vor dem alten Abschlussweg sichern wir die Planungsbemerkung.
+            // Altbestände ohne planningNote bekommen den bisherigen o.note-Inhalt.
+            const planning=dpX10PlanningNote(o);
+            const completion=dpX10Text($('statusNote')?.value||'');
+            o.planningNote=planning;
+
+            // Der alte Abschlussweg darf intern normal arbeiten. Danach wird die
+            // inzwischen überschrieben gewesene o.note wieder zur Auftragsbemerkung.
+            const r=await dpX10BaseConfirmStatus.apply(this,arguments);
+
+            const live=orderById(currentOrderId)||o;
+            // Falls eine bestehende Validierung (z. B. vorgeschaltetes Leeren ohne
+            // Entleerungsbestätigung) den Abschluss abgebrochen hat, darf X10
+            // daraus keinen scheinbaren erfolgreichen Abschluss machen.
+            if(String(live.status||'')!=='Ausgeführt')return r;
+            live.note=planning;
+            live.planningNote=planning;
+            live.completionNote=completion;
+            live.updatedAt=nowIso();
+
+            // Auch der Archiv-Snapshot hält beide Inhalte getrennt fest.
+            const archived=(state.archiveOrders||[]).find(x=>String(x.id)===String(live.id));
+            if(archived){
+              archived.note=planning;
+              archived.planningNote=planning;
+              archived.completionNote=completion;
+            }
+
+            await persist();
+            try{renderAll();}catch(_){ }
+            return r;
+          };
+
+          // ------------------------------------------------------------
+          // 5) RAPPORT: ausschließlich Abschlussbemerkung aus completionNote
+          // ------------------------------------------------------------
+          const dpX10BaseReportPaper=reportPaper;
+          reportPaper=function(o,signer,sig){
+            if(!o)return dpX10BaseReportPaper.apply(this,arguments);
+            // Der bestehende Rapportdruck liest o.note. Für den Druck bekommt er
+            // deshalb eine Kopie, deren note ausschließlich completionNote enthält.
+            const rapportOrder={...o,note:dpX10CompletionNote(o)};
+            return dpX10BaseReportPaper.call(this,rapportOrder,signer,sig);
+          };
+
+          // Falls ein Auftrag nach X10 erneut in der Auftragsmaske bearbeitet wird,
+          // bleibt o.note weiterhin die Planungs-/Auftragsbemerkung. Neue Aufträge
+          // erhalten beim normalen saveOrder ebenfalls genau diesen Inhalt.
+          const dpX10BaseSaveOrder=saveOrder;
+          saveOrder=async function(){
+            const editId=editingOrderId;
+            const before=new Set((state.orders||[]).map(o=>String(o.id)));
+            const note=dpX10Text($('oNote')?.value||'');
+            const r=await dpX10BaseSaveOrder.apply(this,arguments);
+            const saved=editId?orderById(editId):(state.orders||[]).find(o=>!before.has(String(o.id))&&!o.x5PreEmpty);
+            if(saved){
+              saved.note=note;
+              saved.planningNote=note;
+              saved.updatedAt=nowIso();
+              await persist();
+            }
+            return r;
+          };
+
+          // Felder bereits beim Laden installieren; die open*-Wrapper sichern sie
+          // zusätzlich ab, falls ein Modal später dynamisch verändert wurde.
+          dpX10InstallCustomerNotes();
+          dpX10InstallSiteNote();
+          /* DP_X10_BEMERKUNGEN_RAPPORT_END */
+          '''
+
+          t = t.replace(marker, patch + '\n' + marker, 1)
+          p.write_text(t, encoding='utf-8', newline='\n')
+          print('X10: Bemerkungen, Kundentrennung und Rapport-Abschlussbemerkung eingefügt.')
+          PY
+
+          grep -q "DP_X10_BEMERKUNGEN_RAPPORT_BEGIN" dispopilot-online-efd.html
+          grep -q "Allgemeine Bemerkung" dispopilot-online-efd.html
+          grep -q "Interne Bemerkung / nur Büro" dispopilot-online-efd.html
+          grep -q "Bemerkungen / Hinweise" dispopilot-online-efd.html
+          grep -q "completionNote" dispopilot-online-efd.html
+          grep -q "planningNote" dispopilot-online-efd.html
+          grep -q "rapportOrder={...o,note:dpX10Text(o.completionNote" dispopilot-online-efd.html
+          grep -q "push('Kunde',c?.generalNote" dispopilot-online-efd.html
+
+      - name: Replay X9D SPFx and Sass preparation
+        run: python3 .x10-replay-x9d.py spfx
+
+      - name: Set X10 package version
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p=Path('spfx-build/config/package-solution.json')
+          if not p.exists():
+              raise SystemExit('X10 abgebrochen: package-solution.json fehlt nach X9D-SPFx-Vorbereitung.')
+          data=json.loads(p.read_text(encoding='utf-8'))
+          data['solution']['version']='1.3.5.63'
+          p.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          print('SPFx Paketversion auf 1.3.5.63 gesetzt.')
+          PY
+
+          grep -q '"version": "1.3.5.63"' spfx-build/config/package-solution.json
+
+      - name: Verify X10 runtime in SPFx source
+        run: |
+          grep -R -q "DP_X10_BEMERKUNGEN_RAPPORT_BEGIN" spfx-build/src/webparts
+          grep -R -q "Interne Bemerkung / nur Büro" spfx-build/src/webparts
+          grep -R -q "Bemerkungen / Hinweise" spfx-build/src/webparts
+          grep -R -q "completionNote" spfx-build/src/webparts
+          grep -R -q "planningNote" spfx-build/src/webparts
+          grep -R -q "DP_X9C_MULDENTYP_DOPPELTE_MULDE_BEGIN" spfx-build/src/webparts
+          grep -R -q "Neuer Auftrag" spfx-build/src/webparts
+
+      - name: Replay X9D production build and packaging
+        run: python3 .x10-replay-x9d.py build
+
+      - name: Replace release notes for X10
+        run: |
+          test -d artifact/UPLOAD_TO_SITEASSETS
+          test -d artifact/UPLOAD_TO_APP_CATALOG
+          test -f artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+          test "$(find artifact/UPLOAD_TO_SITEASSETS -type f | wc -l)" -gt 0
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DispoLuchs V1.3 - X10 Bemerkungen + Rapport-Trennung - Paketrevision 1.3.5.63
+
+          BASIS:
+          - Baut vollständig auf dem bereits erfolgreich eingesetzten X9D / 1.3.5.62 auf.
+          - X9D „Neuer Auftrag“-Button bleibt enthalten.
+          - X9C Muldentyp- und Doppelprüfung bleibt enthalten.
+          - X9D Sass-Buildfix bleibt enthalten.
+
+          X10 - KUNDENBEMERKUNGEN:
+          - Kundenstamm erhält „Allgemeine Bemerkung“ für operative Fahrerhinweise.
+          - Kundenstamm erhält „Interne Bemerkung / nur Büro“ für kaufmännische/interne Informationen.
+          - Interne Kundenbemerkungen werden niemals in der Fahrer-/Ausführungsansicht angezeigt.
+          - Vorhandene alte, nicht klassifizierte Kunden-note wird aus Datenschutzgründen zunächst nur im internen Bürofeld angeboten und niemals automatisch als Fahrerhinweis übernommen.
+
+          X10 - BAUSTELLENBEMERKUNG:
+          - Baustellen erhalten „Bemerkung / Fahrerhinweis“.
+          - Dieser Hinweis kann zusammen mit dem Auftrag in der Fahreransicht angezeigt werden.
+
+          X10 - GEMEINSAMER HINWEISKASTEN:
+          - In der geöffneten Auftrag-/Ausführungsansicht gibt es EINEN kompakten Kasten „Bemerkungen / Hinweise“.
+          - Angezeigt werden nur tatsächlich vorhandene Inhalte.
+          - Reihenfolge: Auftrag, Baustelle, Kunde, beteiligte Mulde(n).
+          - Muldenhinweise werden eindeutig mit Muldennummer beschriftet.
+          - Keine einzelnen leeren Kästen und keine interne Kundenbemerkung.
+
+          X10 - AUFTRAGSBEMERKUNG / ABSCHLUSSBEMERKUNG:
+          - Die bisher gemeinsam verwendete o.note-Logik wird fachlich getrennt.
+          - Auftrags-/Planungsbemerkung bleibt als Auftragsinformation erhalten.
+          - Beim Status „Ausgeführt“ ist das Bemerkungsfeld ausdrücklich „Bemerkung zum Abschluss / Rapport“.
+          - Diese Abschlussbemerkung wird separat als completionNote gespeichert.
+          - Die ursprüngliche Auftragsbemerkung wird beim Abschluss nicht mehr überschrieben.
+          - Auch der Archiv-Snapshot hält Planungs- und Abschlussbemerkung getrennt.
+
+          X10 - RAPPORT:
+          - Auf dem Rapport erscheint ausschließlich die beim Auftrag-Abschluss erfasste completionNote.
+          - Kundenbemerkungen, Baustellenbemerkungen, Muldenbemerkungen und die ursprüngliche Auftragsbemerkung werden nicht automatisch auf den Rapport übernommen.
+          - Ist completionNote leer, bleibt die Rapport-Bemerkung leer.
+          - Bereits vor X10 ausgeführte Altaufträge behalten ihren bisherigen Rapport-Bemerkungsinhalt; nicht ausgeführte Altaufträge übernehmen ihre Planungsbemerkung NICHT automatisch als Rapportbemerkung.
+
+          X10 KURZTEST:
+          1. Kunde bearbeiten -> beide neuen Kunden-Bemerkungsfelder müssen sichtbar und speicherbar sein.
+          2. Allgemeine Kundenbemerkung eintragen, interne Bemerkung eintragen -> Auftrag dieses Kunden öffnen: nur allgemeine Bemerkung darf erscheinen.
+          3. Baustellenhinweis „Zufahrt über Tor 3“ eintragen -> Auftrag öffnen: Hinweis muss unter „Baustelle:“ erscheinen.
+          4. Auftragsbemerkung eintragen -> Auftrag öffnen: muss unter „Auftrag:“ erscheinen.
+          5. Beteiligte Mulde mit Bemerkung -> Auftrag öffnen: „Mulde <Nr.>: ...“ muss erscheinen.
+          6. Mehrere Mulden mit Bemerkungen -> jede Mulde genau einmal mit Nummer anzeigen.
+          7. Auftrag ohne jegliche Bemerkungen -> kein leerer Bemerkungskasten.
+          8. Auftrag mit Planungsbemerkung auf „Ausgeführt“ setzen -> Abschlussfeld muss zunächst leer sein, nicht mit Planungsbemerkung vorbelegt.
+          9. Beim Abschluss eigene Bemerkung eingeben -> danach Auftrag erneut öffnen: Planungsbemerkung bleibt erhalten.
+          10. Rapport öffnen -> nur Abschlussbemerkung muss auf dem Rapport stehen; keine Kunden-/Baustellen-/Mulden-/Planungsbemerkung.
+          11. Abschlussbemerkung leer lassen -> Rapport-Bemerkung bleibt leer.
+          12. Gegenprobe: interne Kundenbemerkung mit auffälligem Testtext eintragen -> dieser Text darf in keiner Fahreransicht und auf keinem Rapport erscheinen.
+          13. „Neuer Auftrag“ in Aufträge prüfen -> X9D-Funktion muss unverändert vorhanden sein.
+          14. Muldentyp-/Doppelprüfung kurz gegenprüfen -> X9C-Funktion muss unverändert arbeiten.
+          TXT
+
+      - name: Final X10 package checks
+        run: |
+          grep -q "Paketrevision 1.3.5.63" artifact/REIHENFOLGE.txt
+          test -f artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+          test "$(find artifact/UPLOAD_TO_SITEASSETS -type f | wc -l)" -gt 0
+
+      - name: Upload X10 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: X10-BEMERKUNGEN-RAPPORT-DISPOLUCHS-1.3.5.63
+          path: artifact/
+          if-no-files-found: error
