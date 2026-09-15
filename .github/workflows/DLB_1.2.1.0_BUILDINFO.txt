@@ -1,0 +1,33 @@
+DLB 1.2.1.0 – eANV Stufe 1
+
+BASIS
+DLB 1.1.0.7 – Betriebstagebuch Rollen/Kacheln/Fixes vollständig erforderlich.
+
+VERSIONSLOGIK
+1 = DispoLux Beta Hauptlinie
+2 = Modul eANV
+1 = eANV Stufe 1
+0 = erster Versuch dieser Stufe
+
+UMFANG
+- eANV-Verknüpfung direkt am Auftrag
+- eANV-System / Anbieter
+- externe Vorgangs-ID
+- Link zum Vorgang im vorhandenen eANV-System
+- Status + Statusstand
+- mehrere Referenzen / Nummern
+- mehrere Dokumente / Dokumentlinks
+- Anzeige im Auftragsdetail
+- Speicherung am Auftrag und Spiegelung in vorhandene Archivkopien
+- Fahrer kann eANV nicht bearbeiten
+
+STUFE 2 NUR VORBEREITET
+- Adapter: createBegleitschein
+- Adapter: getStatus
+- Adapter: listDocuments
+- keine Zugangsdaten im Browser
+- keine aktive Anbieter-/ZKS-Kommunikation
+
+SICHERUNG
+Der Builder akzeptiert ausschließlich DLB 1.1.0.7 mit Betriebstagebuch- und dpBT-Markern.
+Ältere Builds werden abgewiesen.
