@@ -1,0 +1,194 @@
+name: DLB-028E-1.12.1.1 Multiuser Auftragssync Hotfix SMALL V2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      BASE_ARTIFACT: DLB-029A-1.11.2.0-PDF-UPLOAD-OPEN-FIX-PROD-SPFX-1.3.6.62
+      OUT_ARTIFACT: DLB-028E-1.12.1.1-MULTIUSER-AUFTRAGSSYNC-SITEASSETS-HOTFIX
+
+    steps:
+      - name: Download latest successful 029A artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p base
+
+          ART_ID="$({
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" || true
+          } | jq -r --arg NAME "$BASE_ARTIFACT" '.artifacts[]? | select(.name==$NAME and .expired==false) | .id' | head -n 1)"
+
+          if [ -z "$ART_ID" ]; then
+            echo "Fehler: Basis-Artefakt '$BASE_ARTIFACT' wurde nicht gefunden oder ist abgelaufen." >&2
+            echo "Bitte DLB-029A einmal erfolgreich ausführen und danach diesen Hotfix erneut starten." >&2
+            exit 1
+          fi
+
+          echo "Verwende 029A-Artefakt-ID: $ART_ID"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ART_ID}/zip" > /tmp/029a.zip
+          unzip -q /tmp/029a.zip -d base
+
+          SITE_DIR="$(find base -type d -name UPLOAD_TO_SITEASSETS -print -quit)"
+          if [ -z "$SITE_DIR" ]; then
+            echo "Fehler: UPLOAD_TO_SITEASSETS im 029A-Artefakt nicht gefunden." >&2
+            find base -maxdepth 3 -type f -print >&2 || true
+            exit 1
+          fi
+          echo "SITE_DIR=$SITE_DIR" >> "$GITHUB_ENV"
+
+      - name: Patch multiuser-safe order persistence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          import os
+
+          site_dir = Path(os.environ.get('SITE_DIR', ''))
+          if not site_dir.is_dir():
+              raise SystemExit(f'DLB-028E: SITE_DIR ungültig: {site_dir}')
+
+          # Das 029A-Artefakt kann mehr als ein WebPart-Bundle enthalten.
+          # Gepatcht wird ausschließlich das Bundle, das die bekannte
+          # DispoLux-Speicherroutine tatsächlich enthält.
+          candidates = list(site_dir.rglob('dispo-pilot-online-web-part_*.js'))
+          signature = 'async save(e){const t=this.desiredRecords(e);'
+          files = []
+          for candidate in candidates:
+              try:
+                  content = candidate.read_text(encoding='utf-8')
+              except UnicodeDecodeError:
+                  continue
+              if signature in content:
+                  files.append(candidate)
+
+          if len(files) != 1:
+              print('Gefundene WebPart-JS:', *[str(x) for x in candidates], sep='\n - ')
+              print('Davon mit DispoLux-Speichersignatur:', *[str(x) for x in files], sep='\n - ')
+              raise SystemExit(f'DLB-028E: genau ein passendes DispoLux-WebPart-JS erwartet, gefunden: {len(files)}')
+
+          p = files[0]
+          s = p.read_text(encoding='utf-8')
+          Path('/tmp/dlb028e_target.txt').write_text(str(p), encoding='utf-8')
+
+          old = re.compile(
+              r'async save\(e\)\{const t=this\.desiredRecords\(e\);'
+              r'for\(const\[e,n\]of t\)\{const t=this\.remote\.get\(e\);'
+              r't\?t\.type===n\.type&&t\.raw===n\.raw\|\|await this\.update\(t,n\):await this\.create\(n\)\}'
+              r'for\(const\[e,n\]of\[\.\.\.this\.remote\]\)t\.has\(e\)\|\|await this\.remove\(n\)\}'
+          )
+
+          if not old.search(s):
+              raise SystemExit('DLB-028E: erwartete 029A-Speicherroutine nicht gefunden. Nichts wurde verändert.')
+
+          new = r'''async save(e){
+            const dp028e="DLB-028E-1.12.1.1";
+            await this.loadItems();
+            const t=this.desiredRecords(e);
+            for(const[a,i]of t){
+              const r=this.remote.get(a);
+              if(!r){await this.create(i);continue}
+              if(r.type===i.type&&r.raw===i.raw)continue;
+              if(i.type==="orders"){
+                let l=0,s=0;
+                try{const e=JSON.parse(i.raw||"{}");l=Date.parse(String(e.updatedAt||e.createdAt||""))||0}catch(_){ }
+                try{const e=JSON.parse(r.raw||"{}");s=Date.parse(String(e.updatedAt||e.createdAt||""))||0}catch(_){ }
+                if(l<=s)continue
+              }
+              await this.update(r,i)
+            }
+            const d=new Set((e.archiveOrders||[]).filter(e=>e&&e.deletedInPlanning).map(e=>`DP|orders|${this.keySafe(e.id)}`));
+            for(const[a,i]of[...this.remote]){
+              if(t.has(a))continue;
+              if(String(i.type||"")==="orders"&&d.has(a))await this.remove(i)
+            }
+            void dp028e
+          }'''
+
+          s2, count = old.subn(new, s, count=1)
+          if count != 1:
+              raise SystemExit(f'DLB-028E: Speicherroutine {count}x ersetzt; erwartet 1x.')
+
+          p.write_text(s2, encoding='utf-8')
+          print('Gepatcht:', p)
+          PY
+
+      - name: Verify hotfix
+        shell: bash
+        run: |
+          set -euo pipefail
+          JS="$(cat /tmp/dlb028e_target.txt)"
+          test -f "$JS"
+          case "$JS" in
+            "$SITE_DIR"/*) ;;
+            *) echo "Fehler: Patch-Ziel liegt nicht in UPLOAD_TO_SITEASSETS: $JS" >&2; exit 1 ;;
+          esac
+          grep -Fq 'DLB-028E-1.12.1.1' "$JS"
+          grep -Fq 'await this.loadItems()' "$JS"
+          grep -Fq 'deletedInPlanning' "$JS"
+          if grep -Fq 'for(const[e,n]of[...this.remote])t.has(e)||await this.remove(n)' "$JS"; then
+            echo 'Fehler: alte destruktive Vollbestands-Löschlogik ist im Patch-Ziel noch vorhanden.' >&2
+            exit 1
+          fi
+          node --check "$JS"
+          echo "Hotfix geprüft in: $JS"
+
+      - name: Prepare deployment package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifact
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS
+          cp -a "$SITE_DIR"/. artifact/UPLOAD_TO_SITEASSETS/
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DLB-028E-1.12.1.1 · MULTIUSER AUFTRAGSSYNC HOTFIX
+          Basis: DLB-029A-1.11.2.0 / bestehendes SPFx-Paket 1.3.6.62
+
+          WICHTIG:
+          - Nur die Dateien aus UPLOAD_TO_SITEASSETS ersetzen.
+          - Das App-Catalog-SPPKG bleibt bei diesem kleinen Hotfix unverändert.
+          - Danach DispoLux auf allen Geräten vollständig schließen und neu öffnen.
+
+          FIX:
+          - Vor jedem Speichern wird der aktuelle SharePoint-Auftragsstand neu gelesen.
+          - Ein Auftrag, der nur im lokalen Browser fehlt, wird NICHT mehr automatisch gelöscht.
+          - Bestehende Aufträge werden nur überschrieben, wenn die lokale Auftragsversion zeitlich neuer ist.
+          - Bewusstes Löschen über DispoLux bleibt möglich; nur deletedInPlanning darf den zentralen Auftrag entfernen.
+          - Keine automatische Dublettenbereinigung.
+
+          TEST MIT ZWEI BENUTZERN:
+          1. Beide Benutzer DispoLux nach Installation komplett neu öffnen.
+          2. Benutzer A legt Auftrag A an und speichert.
+          3. Benutzer B wartet auf Auto-Sync bzw. drückt Aktualisieren und legt Auftrag B an.
+          4. Beide aktualisieren: A und B müssen auf beiden Geräten vorhanden bleiben.
+          5. Benutzer A ändert Auftrag A, Benutzer B Auftrag B.
+          6. Erneut auf beiden Geräten aktualisieren: beide Änderungen müssen erhalten bleiben.
+          7. Erst danach einen Auftrag starten/ausführen und Mulden-/Archivstatus prüfen.
+          8. Vorhandene Mehrfachaufträge erst NACH bestandenem Test kontrolliert bereinigen.
+          TXT
+
+          cat > artifact/HOTFIX_INFO.txt <<'TXT'
+          Produkt-Hotfix: 1.12.1.1
+          Technische Basis: DLB-029A / SPFx 1.3.6.62
+          Art: kleiner SiteAssets-Hotfix; kein neues SPPKG erforderlich
+          Ursache: veraltete Browser-Sitzungen durften beim Gesamtspeichern zentral vorhandene Aufträge löschen bzw. ältere Auftragsstände zurückschreiben.
+          TXT
+
+      - name: Upload hotfix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUT_ARTIFACT }}
+          path: artifact/
+          if-no-files-found: error
