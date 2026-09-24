@@ -1,0 +1,217 @@
+name: DLB-028F-1.12.1.1 Multiuser Sync Cache Fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      BASE_ARTIFACT: DLB-029A-1.11.2.0-PDF-UPLOAD-OPEN-FIX-PROD-SPFX-1.3.6.62
+      OUT_ARTIFACT: DLB-028F-1.12.1.1-MULTIUSER-SYNC-CACHE-SITEASSETS
+
+    steps:
+      - name: Download latest successful 029A artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p base
+
+          ART_ID="$({
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" || true
+          } | jq -r --arg NAME "$BASE_ARTIFACT" '.artifacts[]? | select(.name==$NAME and .expired==false) | .id' | head -n 1)"
+
+          if [ -z "$ART_ID" ]; then
+            echo "Fehler: Basis-Artefakt '$BASE_ARTIFACT' wurde nicht gefunden oder ist abgelaufen." >&2
+            exit 1
+          fi
+
+          echo "Verwende 029A-Artefakt-ID: $ART_ID"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ART_ID}/zip" > /tmp/029a.zip
+          unzip -q /tmp/029a.zip -d base
+
+          SITE_DIR="$(find base -type d -name UPLOAD_TO_SITEASSETS -print -quit)"
+          if [ -z "$SITE_DIR" ]; then
+            echo "Fehler: UPLOAD_TO_SITEASSETS im 029A-Artefakt nicht gefunden." >&2
+            find base -maxdepth 4 -type f -print >&2 || true
+            exit 1
+          fi
+          echo "SITE_DIR=$SITE_DIR" >> "$GITHUB_ENV"
+
+      - name: Patch all DispoLux WebPart bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          site_dir = Path(os.environ['SITE_DIR'])
+          candidates = sorted(site_dir.rglob('dispo-pilot-online-web-part_*.js'))
+          if not candidates:
+              raise SystemExit('DLB-028F: keine WebPart-JS in UPLOAD_TO_SITEASSETS gefunden.')
+
+          save_pat = re.compile(r'async save\(e\)\{.*?\}(?=,async load\(\)\{)', re.S)
+          load_pat = re.compile(
+              r'async loadItems\(\)\{(?P<body>.*?)\}(?=,keySafe:)',
+              re.S
+          )
+          old_get = 'this.request(t,{headers:{Accept:"application/json;odata=nometadata"}})'
+          new_get = 'this.request(t,{headers:{Accept:"application/json;odata=nometadata","Cache-Control":"no-cache, no-store, max-age=0",Pragma:"no-cache",Expires:"0"},cache:"no-store"})'
+
+          new_save = '''async save(e){
+            const dp028f="DLB-028F-1.12.1.1";
+            const t=this.desiredRecords(e);
+            for(const[e,n]of t){
+              const t=this.remote.get(e);
+              t?t.type===n.type&&t.raw===n.raw||await this.update(t,n):await this.create(n)
+            }
+            const d=new Set((e.archiveOrders||[]).filter(e=>e&&e.deletedInPlanning).map(e=>`DP|orders|${this.keySafe(e.id)}`));
+            for(const[e,n]of[...this.remote]){
+              if(t.has(e))continue;
+              if(String(n.type||"")==="orders"){
+                if(d.has(e))await this.remove(n);
+                continue
+              }
+              await this.remove(n)
+            }
+            void dp028f
+          }'''
+
+          prepared = []
+          diagnostics = []
+          for p in candidates:
+              s = p.read_text(encoding='utf-8')
+              save_matches = list(save_pat.finditer(s))
+              load_matches = list(load_pat.finditer(s))
+              has_signature = 'async save(e){const t=this.desiredRecords(e);' in s
+              diagnostics.append((p, has_signature, len(save_matches), len(load_matches), s.count(old_get)))
+              if not has_signature:
+                  continue
+              if len(save_matches) != 1:
+                  raise SystemExit(f'DLB-028F: {p.name}: save()-Block {len(save_matches)}x gefunden; erwartet 1x.')
+              if len(load_matches) != 1:
+                  raise SystemExit(f'DLB-028F: {p.name}: loadItems()-Block {len(load_matches)}x gefunden; erwartet 1x.')
+              body = load_matches[0].group('body')
+              if body.count(old_get) != 1:
+                  raise SystemExit(f'DLB-028F: {p.name}: ungecachten DP_Data-GET in loadItems {body.count(old_get)}x gefunden; erwartet 1x.')
+              prepared.append((p, s, save_matches[0], load_matches[0]))
+
+          print('WebPart-Prüfung:')
+          for p, sig, sc, lc, gc in diagnostics:
+              print(f' - {p.name}: Signatur={sig}, save={sc}, loadItems={lc}, GET-Muster gesamt={gc}')
+
+          if not prepared:
+              raise SystemExit('DLB-028F: kein DispoLux-Bundle mit bekannter Speichersignatur gefunden.')
+
+          # Erst nachdem ALLE Ziele erfolgreich vorgeprüft sind, werden Dateien verändert.
+          targets = []
+          for p, s, save_m, load_m in prepared:
+              s2 = s[:save_m.start()] + new_save + s[save_m.end():]
+
+              # loadItems nach dem save()-Ersatz erneut lokalisieren, damit Positionen sicher stimmen.
+              lm2 = load_pat.search(s2)
+              if not lm2:
+                  raise SystemExit(f'DLB-028F: {p.name}: loadItems nach save-Patch nicht mehr gefunden.')
+              body2 = lm2.group('body')
+              if body2.count(old_get) != 1:
+                  raise SystemExit(f'DLB-028F: {p.name}: GET-Muster nach save-Patch nicht eindeutig.')
+              new_body = body2.replace(old_get, new_get, 1)
+              s3 = s2[:lm2.start('body')] + new_body + s2[lm2.end('body'):]
+
+              p.write_text(s3, encoding='utf-8')
+              targets.append(str(p))
+              print('Gepatcht:', p)
+
+          Path('/tmp/dlb028f_targets.txt').write_text('\n'.join(targets)+'\n', encoding='utf-8')
+          PY
+
+      - name: Verify all patched bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s /tmp/dlb028f_targets.txt
+          COUNT=0
+          while IFS= read -r JS; do
+            [ -n "$JS" ] || continue
+            COUNT=$((COUNT+1))
+            test -f "$JS"
+            case "$JS" in
+              "$SITE_DIR"/*) ;;
+              *) echo "Fehler: Patch-Ziel liegt nicht in UPLOAD_TO_SITEASSETS: $JS" >&2; exit 1 ;;
+            esac
+            grep -Fq 'DLB-028F-1.12.1.1' "$JS"
+            grep -Fq 'Cache-Control":"no-cache, no-store, max-age=0' "$JS"
+            grep -Fq 'cache:"no-store"' "$JS"
+            grep -Fq 'deletedInPlanning' "$JS"
+            if grep -Fq 'for(const[e,n]of[...this.remote])t.has(e)||await this.remove(n)' "$JS"; then
+              echo "Fehler: alte automatische Auftrags-Löschlogik noch vorhanden: $JS" >&2
+              exit 1
+            fi
+            node --check "$JS"
+            echo "Geprüft: $JS"
+          done < /tmp/dlb028f_targets.txt
+
+          if [ "$COUNT" -lt 1 ]; then
+            echo "Fehler: kein Bundle geprüft." >&2
+            exit 1
+          fi
+          echo "Erfolgreich gepatchte und geprüfte Bundles: $COUNT"
+
+      - name: Prepare deployment package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifact
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS
+          cp -a "$SITE_DIR"/. artifact/UPLOAD_TO_SITEASSETS/
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DLB-028F-1.12.1.1 · MULTIUSER SYNC / CACHE FIX
+          Basis: DLB-029A-1.11.2.0 / bestehendes SPFx-Paket 1.3.6.62
+
+          INSTALLATION:
+          - Nur den Inhalt von UPLOAD_TO_SITEASSETS ersetzen.
+          - SPPKG im App Catalog NICHT ändern.
+          - Danach DispoLux auf ALLEN Geräten/Tabs vollständig schließen.
+          - Anschließend neu öffnen.
+
+          FIX 028F:
+          - Alle im 029A-Artefakt enthaltenen DispoLux-WebPart-Bundles werden gepatcht.
+          - DP_Data wird auch beim normalen Programmstart ohne Browser-/HTTP-Cache gelesen.
+          - Ein zentral vorhandener Auftrag wird nicht mehr allein deshalb gelöscht, weil er in einer lokalen Sitzung fehlt.
+          - Bewusstes Löschen eines geplanten Auftrags bleibt über deletedInPlanning möglich.
+          - Keine automatische Bereinigung bestehender Mehrfachaufträge.
+
+          ERSTER TEST:
+          1. Nur zwei frisch gestartete Instanzen verwenden.
+          2. Benutzer A legt genau EINEN neuen geplanten Auftrag an.
+          3. 10 Sekunden warten.
+          4. Benutzer B drückt Aktualisieren: Auftrag A muss erscheinen.
+          5. Benutzer B legt genau EINEN anderen Auftrag an.
+          6. 10 Sekunden warten.
+          7. Beide Browser aktualisieren: beide Aufträge müssen auf beiden Geräten sichtbar bleiben.
+          8. Noch KEINE vorhandenen Dubletten löschen, bevor dieser Test bestanden ist.
+          TXT
+
+          cat > artifact/HOTFIX_INFO.txt <<'TXT'
+          DLB: 028F
+          Produktversion: 1.12.1.1
+          Basis: DLB-029A / SPFx 1.3.6.62
+          Art: SiteAssets-Hotfix, kein neues SPPKG
+          Schwerpunkt: frischer DP_Data-Ladevorgang + Schutz vor implizitem Löschen fremder Aufträge
+          TXT
+
+      - name: Upload hotfix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUT_ARTIFACT }}
+          path: artifact/
+          if-no-files-found: error
