@@ -1,0 +1,196 @@
+name: DLB-030AC-1.12.1.22 DP DATA START DIAGNOSE FULL BUILD PROD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Rebuild exact DLB-030J basis from repository workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY_RUN_030J'
+          from pathlib import Path
+          import subprocess, yaml
+
+          wf = Path(".github/workflows/DLB-030J-1.12.1.3_ORDERS_DIREKT_SYNC_FULL_BUILD.yml")
+          if not wf.exists():
+              raise SystemExit("030AC: Original-Workflow 030J fehlt im Repository.")
+
+          doc = yaml.safe_load(wf.read_text(encoding="utf-8"))
+          steps = doc["jobs"]["build"]["steps"]
+          runs = [(s.get("name",""), s.get("run")) for s in steps if s.get("run")]
+
+          if not runs:
+              raise SystemExit("030AC: Keine 030J-Buildschritte gefunden.")
+
+          for idx, (name, script) in enumerate(runs, 1):
+              print(f"\n===== 030AC führt 030J-Schritt {idx}/{len(runs)} aus: {name} =====")
+              runner = Path(f".030ac_030j_step_{idx}.sh")
+              runner.write_text(script, encoding="utf-8", newline="\n")
+              try:
+                  subprocess.run(["bash", "-euo", "pipefail", str(runner)], check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+
+          print("030AC: Originale 030J-Basis vollständig rekonstruiert.")
+          PY_RUN_030J
+
+      - name: Apply 030AC diagnostic DP_Data read filter
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH_030AC'
+          from pathlib import Path
+
+          files = list(Path("spfx-build/src/webparts").rglob("*.ts")) + list(Path("spfx-build/src/webparts").rglob("*.tsx")) + list(Path("spfx-build/src/webparts").rglob("*.js"))
+          changed = []
+
+          needle = "async loadItems(){"
+          top = "&$top=5000"
+          replacement = "&$filter=startswith%28Title%2C%27DP%7C%27%29&$top=5000"
+
+          for p in files:
+              s = p.read_text(encoding="utf-8")
+              pos = 0
+              count = 0
+              while True:
+                  start = s.find(needle, pos)
+                  if start < 0:
+                      break
+                  end = s.find("return out}", start)
+                  if end < 0:
+                      end = min(len(s), start + 6000)
+                  q = s.find(top, start, end)
+                  if q < 0:
+                      pos = start + len(needle)
+                      continue
+                  s = s[:q] + replacement + s[q+len(top):]
+                  count += 1
+                  pos = q + len(replacement)
+              if count:
+                  p.write_text(s, encoding="utf-8", newline="\n")
+                  changed.append((str(p), count))
+
+          total = sum(count for _, count in changed)
+          if len(changed) != 1 or total != 2:
+              raise SystemExit(f"030AC: erwartete zwei loadItems-Lesewege in genau einer Runtime-Datei, gefunden: {changed}")
+
+          print("030AC geändert:", changed[0][0], "Treffer:", total)
+          print("030AC: loadItems fragt beim Start nur Title beginnend mit DP| ab.")
+          PY_PATCH_030AC
+
+      - name: Set 030AC SPFx version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VER_030AC'
+          from pathlib import Path
+          p = Path("spfx-build/config/package-solution.json")
+          s = p.read_text(encoding="utf-8")
+          if "1.3.6.68" not in s:
+              raise SystemExit("030AC: erwartete 030J-SPFx-Version 1.3.6.68 fehlt.")
+          p.write_text(s.replace("1.3.6.68", "1.3.6.87", 1), encoding="utf-8", newline="\n")
+          PY_VER_030AC
+
+      - name: Validate 030AC source before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -R -Fq 'DP_DLB_030J_1_12_1_3_ORDERS_DIREKT_SYNC_BEGIN' spfx-build/src/webparts
+          grep -R -Fq 'DP_DLB_030I_1_12_1_2_MULTIUSER_SYNC_CACHE_BEGIN' spfx-build/src/webparts
+          grep -R -Fq 'DP_DLB_028D_1_12_1_0_DATENSICHERUNG_DATENINTEGRITAET_BEGIN' spfx-build/src/webparts
+          grep -R -Fq 'dp030jLoadOrdersDirect' spfx-build/src/webparts
+          COUNT=$(grep -R -F -o 'startswith%28Title%2C%27DP%7C%27%29' spfx-build/src/webparts | wc -l)
+          test "$COUNT" -eq 2
+          ! grep -R -Fq '${encodeURIComponent("startswith(Title,' spfx-build/src/webparts
+          grep -Fq '1.3.6.87' spfx-build/config/package-solution.json
+
+      - name: Build and package 030AC
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd spfx-build && npx heft build --production)
+          (cd spfx-build && npx heft package-solution --production)
+
+          rm -rf artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n1)
+          test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          if [ -d spfx-build/release/assets ]; then
+            cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d spfx-build/temp/deploy ]; then
+            cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else
+            echo "030AC: Keine SPFx Asset-Ausgabe gefunden." >&2
+            exit 1
+          fi
+
+          if [ -f .dpx14_icon_b64 ]; then
+            python3 - <<'PY_ICON_030AC'
+          from pathlib import Path
+          import base64
+          Path("artifact/UPLOAD_TO_SITEASSETS/DispoLux_DL_Icon_48.png").write_bytes(
+              base64.b64decode(Path(".dpx14_icon_b64").read_text().strip())
+          )
+          PY_ICON_030AC
+          fi
+
+      - name: Validate emitted 030AC package
+        shell: bash
+        run: |
+          set -euo pipefail
+          JS=$(find artifact/UPLOAD_TO_SITEASSETS -maxdepth 1 -type f -name '*.js' | head -n1)
+          test -n "$JS"
+          node --check "$JS"
+          grep -Fq "startswith%28Title%2C%27DP%7C%27%29" "$JS"
+          node --check "$JS"
+          grep -Fq "DP|orders|" "$JS"
+          grep -Fq "dp030jLoadOrdersDirect" "$JS"
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DLB-030AC-1.12.1.22 · DP_DATA START-DIAGNOSE · SPFx 1.3.6.87
+
+          Basis: originale DLB-030J-1.12.1.3 aus dem Repository.
+          Einzige fachliche Diagnoseänderung:
+          Der normale DP_Data-Startlesevorgang lädt direkt nur Datensätze,
+          deren Title mit DP| beginnt. DPB|-Backups werden dabei nicht geladen.
+
+          Keine Daten werden gelöscht, umbenannt oder zusammengeführt.
+          Die bestehende 028D-Backupfunktion bleibt in diesem Diagnose-Build unverändert.
+
+          Installation:
+          1. UPLOAD_TO_SITEASSETS
+          2. UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+          3. DispoLux auf allen Geräten/Tabs vollständig schließen und frisch öffnen.
+
+          Diagnose:
+          - Startet 030AC deutlich anders als 030J, ist das vollständige Einlesen
+            der stark angewachsenen DP_Data-Liste als Ursache sehr wahrscheinlich.
+          - Startet 030AC ebenfalls nicht, ist diese konkrete Start-Leseursache
+            weitgehend ausgeschlossen.
+          TXT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-030AC-1.12.1.22-DP-DATA-START-DIAGNOSE-SPFX-1.3.6.87
+          path: artifact/
+          if-no-files-found: error
