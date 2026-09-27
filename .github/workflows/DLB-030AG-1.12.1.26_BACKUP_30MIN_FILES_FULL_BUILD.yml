@@ -1,0 +1,423 @@
+name: DLB-030AG-1.12.1.26 BACKUP 30MIN FILES FULL BUILD PROD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Rebuild exact DLB-030AE basis from repository workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY_RUN_030AE'
+          from pathlib import Path
+          import subprocess, yaml
+
+          wf = Path(".github/workflows/DLB-030AE-1.12.1.24_DPB_AUS_DP_DATA_ENTFERNT_FULL_BUILD_MANUELL.yml")
+          if not wf.exists():
+              raise SystemExit("030AG: Original-Workflow 030AE fehlt im Repository.")
+
+          doc = yaml.safe_load(wf.read_text(encoding="utf-8"))
+          steps = doc["jobs"]["build"]["steps"]
+          runs = [(s.get("name",""), s.get("run")) for s in steps if s.get("run")]
+          if not runs:
+              raise SystemExit("030AG: Keine 030AE-Buildschritte gefunden.")
+
+          for idx, (name, script) in enumerate(runs, 1):
+              print(f"\n===== 030AG führt 030AE-Schritt {idx}/{len(runs)} aus: {name} =====")
+              runner = Path(f".030af_030ae_step_{idx}.sh")
+              runner.write_text(script, encoding="utf-8", newline="\n")
+              try:
+                  subprocess.run(["bash", "-euo", "pipefail", str(runner)], check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+          print("030AG: Originale 030AE-Basis vollständig rekonstruiert.")
+          PY_RUN_030AE
+
+      - name: Apply 030AG separate 30-minute file backup
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH_030AG'
+          from pathlib import Path
+
+          files = list(Path("spfx-build/src/webparts").rglob("*.ts")) + list(Path("spfx-build/src/webparts").rglob("*.tsx")) + list(Path("spfx-build/src/webparts").rglob("*.js"))
+          ae_marker = "DP_DLB_030AE_1_12_1_24_DPB_AUS_DP_DATA_ENTFERNT_BEGIN"
+          old_end = "/* DP_DLB_028D_1_12_1_0_DATENSICHERUNG_DATENINTEGRITAET_END */"
+          candidates = []
+          for p in files:
+              s = p.read_text(encoding="utf-8")
+              if ae_marker in s and old_end in s:
+                  candidates.append(p)
+          if len(candidates) != 1:
+              raise SystemExit(f"030AG: erwartete genau eine Runtime-Datei, gefunden: {[str(x) for x in candidates]}")
+
+          p = candidates[0]
+          s = p.read_text(encoding="utf-8")
+          if "DP_DLB_030AG_1_12_1_26_BACKUP_30MIN_FILES_BEGIN" in s:
+              raise SystemExit("030AG: Patch bereits vorhanden.")
+          if s.count(old_end) != 1:
+              raise SystemExit(f"030AG: 028D-Endmarker {s.count(old_end)}x statt 1x.")
+
+          patch = r'''
+            /* DP_DLB_030AG_1_12_1_26_BACKUP_30MIN_FILES_BEGIN */
+            const dp30afWindow: any = window as any;
+            if (!dp30afWindow.__DISPOLUX_FILE_BACKUP_030AG) {
+              Object.defineProperty(dp30afWindow, '__DISPOLUX_FILE_BACKUP_030AG', { value: true, writable: true, configurable: true });
+              const dp30afContext: any = this.context as any;
+              const dp30afDataList = 'DP_Data';
+              const dp30afLibrary = 'DispoLux_Backup';
+              const dp30afIntervalMs = 30 * 60 * 1000;
+              const dp30afRetentionMs = 54 * 60 * 60 * 1000;
+              const dp30afOpenedAt = Date.now();
+              let dp30afQueue: Promise<void> = Promise.resolve();
+              let dp30afLastSuccess = 0;
+              let dp30afLastCloseKick = 0;
+
+              const dp30afWebUrl = (): string => String(dp30afContext.pageContext.web.absoluteUrl || '').replace(/\/$/, '');
+              const dp30afEsc = (v: string): string => String(v || '').replace(/'/g, "''");
+              const dp30afListApi = (title: string): string => `${dp30afWebUrl()}/_api/web/lists/getbytitle('${dp30afEsc(title)}')`;
+
+              const dp30afWarn = (message: string): void => {
+                try {
+                  let box = host.querySelector('#dp30afBackupWarning') as HTMLDivElement | null;
+                  if (!box) {
+                    box = document.createElement('div');
+                    box.id = 'dp30afBackupWarning';
+                    box.style.cssText = 'display:none;margin:0 0 8px 0;padding:9px 12px;border:2px solid #b91c1c;border-radius:9px;background:#fef2f2;color:#7f1d1d;font:700 13px Arial,sans-serif';
+                    host.insertBefore(box, host.firstChild);
+                  }
+                  box.textContent = message;
+                  box.style.display = message ? 'block' : 'none';
+                } catch (_) {}
+              };
+
+              const dp30afGetResponse = async (url: string): Promise<any> => dp30afContext.spHttpClient.get(
+                url,
+                SPHttpClient.configurations.v1,
+                { headers: { 'Accept': 'application/json;odata=nometadata', 'Cache-Control': 'no-cache, no-store' } }
+              );
+
+              const dp30afGet = async (url: string): Promise<any> => {
+                const response: any = await dp30afGetResponse(url);
+                if (!response.ok) {
+                  const detail = await response.text();
+                  throw new Error(`GET ${response.status}: ${detail.slice(0,700)}`);
+                }
+                return response.json();
+              };
+
+              const dp30afPost = async (url: string, body?: any, extraHeaders?: any): Promise<any> => {
+                const headers: any = {
+                  'Accept': 'application/json;odata=nometadata',
+                  'Content-Type': 'application/json;odata=nometadata',
+                  ...(extraHeaders || {})
+                };
+                const options: any = { headers };
+                if (body !== undefined) options.body = typeof body === 'string' ? body : JSON.stringify(body);
+                const response: any = await dp30afContext.spHttpClient.post(url, SPHttpClient.configurations.v1, options);
+                if (!response.ok) {
+                  const detail = await response.text();
+                  throw new Error(`POST ${response.status}: ${detail.slice(0,900)}`);
+                }
+                const txt = await response.text();
+                if (!txt) return {};
+                try { return JSON.parse(txt); } catch (_) { return {}; }
+              };
+
+              const dp30afEnsureLibrary = async (): Promise<void> => {
+                const check: any = await dp30afGetResponse(`${dp30afListApi(dp30afLibrary)}?$select=Id,Title,BaseTemplate,EnableVersioning`);
+                if (check.ok) {
+                  try {
+                    await dp30afPost(dp30afListApi(dp30afLibrary), { EnableVersioning: false }, { 'X-HTTP-Method': 'MERGE', 'IF-MATCH': '*' });
+                  } catch (e) {
+                    console.warn('030AG: Versionsverwaltung der Backup-Bibliothek konnte nicht deaktiviert werden.', e);
+                  }
+                  return;
+                }
+                if (Number(check.status) !== 404) {
+                  const detail = await check.text();
+                  throw new Error(`Backup-Bibliothek prüfen ${check.status}: ${detail.slice(0,700)}`);
+                }
+                await dp30afPost(`${dp30afWebUrl()}/_api/web/lists`, {
+                  Title: dp30afLibrary,
+                  Description: 'Automatische DispoLux-Datensicherungen. Eine JSON-Datei je 30-Minuten-Zeitfenster.',
+                  BaseTemplate: 101,
+                  OnQuickLaunch: false,
+                  EnableVersioning: false
+                });
+              };
+
+              const dp30afFields = async (): Promise<any> => {
+                const data = await dp30afGet(`${dp30afListApi(dp30afDataList)}/fields?$select=Title,InternalName,TypeAsString&$top=5000`);
+                const fields: any[] = Array.isArray(data.value) ? data.value : [];
+                const norm = (v: any): string => String(v || '').replace(/_x005f_/gi, '_').replace(/\s+/g, '_').toLowerCase();
+                const find = (name: string): any => fields.find(x => norm(x.Title) === norm(name)) || fields.find(x => norm(x.InternalName) === norm(name));
+                const typ = find('DP_Typ') || find('Wert');
+                const daten = find('DP_Daten');
+                if (!typ || !daten) throw new Error('DP_Typ oder DP_Daten in DP_Data nicht gefunden.');
+                return { typ: String(typ.InternalName), daten: String(daten.InternalName) };
+              };
+
+              const dp30afLoadLiveRows = async (): Promise<any[]> => {
+                const f = await dp30afFields();
+                const filter = encodeURIComponent("startswith(Title,'DP|')");
+                let url = `${dp30afListApi(dp30afDataList)}/items?$select=Id,Title,${encodeURIComponent(f.typ)},${encodeURIComponent(f.daten)}&$filter=${filter}&$top=5000`;
+                const rows: any[] = [];
+                while (url) {
+                  const data = await dp30afGet(url);
+                  const part: any[] = Array.isArray(data.value) ? data.value : (Array.isArray(data?.d?.results) ? data.d.results : []);
+                  for (const x of part) {
+                    const title = String(x.Title || '');
+                    if (!title.startsWith('DP|')) continue;
+                    rows.push({
+                      SourceId: Number(x.Id || x.ID || 0),
+                      Title: title,
+                      DP_Typ: String(x[f.typ] || ''),
+                      DP_Daten: String(x[f.daten] || '')
+                    });
+                  }
+                  url = String(data['@odata.nextLink'] || data?.d?.__next || '');
+                }
+                rows.sort((a, b) => String(a.Title).localeCompare(String(b.Title)));
+                return rows;
+              };
+
+              const dp30afSlotFileName = (now: number): string => {
+                const slot = new Date(Math.floor(now / dp30afIntervalMs) * dp30afIntervalMs);
+                const stamp = slot.toISOString().replace(/:/g, '-').replace(/\.\d{3}Z$/, 'Z');
+                return `DP_Data_${stamp}.json`;
+              };
+
+              const dp30afUpload = async (fileName: string, jsonText: string): Promise<void> => {
+                const url = `${dp30afListApi(dp30afLibrary)}/RootFolder/Files/Add(url='${dp30afEsc(fileName)}',overwrite=true)`;
+                await dp30afPost(url, jsonText, { 'Content-Type': 'application/json; charset=utf-8' });
+              };
+
+              const dp30afCleanup = async (now: number): Promise<void> => {
+                const data = await dp30afGet(`${dp30afListApi(dp30afLibrary)}/RootFolder/Files?$select=Name,TimeCreated,ServerRelativeUrl&$top=5000`);
+                const files: any[] = Array.isArray(data.value) ? data.value : [];
+                const cutoff = now - dp30afRetentionMs;
+                for (const file of files) {
+                  const name = String(file.Name || '');
+                  if (!name.startsWith('DP_Data_') || !name.endsWith('.json')) continue;
+                  const created = Date.parse(String(file.TimeCreated || '')) || 0;
+                  if (!created || created > cutoff) continue;
+                  const rel = String(file.ServerRelativeUrl || '');
+                  if (!rel) continue;
+                  try {
+                    await dp30afPost(`${dp30afWebUrl()}/_api/web/getfilebyserverrelativeurl('${dp30afEsc(rel)}')`, undefined, { 'X-HTTP-Method': 'DELETE', 'IF-MATCH': '*' });
+                  } catch (e) {
+                    console.warn('030AG: alte Backup-Datei konnte nicht gelöscht werden:', name, e);
+                  }
+                }
+              };
+
+              const dp30afDoBackup = async (reason: string): Promise<void> => {
+                const now = Date.now();
+                await dp30afEnsureLibrary();
+                const rows = await dp30afLoadLiveRows();
+                if (!rows.length) throw new Error('DP_Data enthält keine produktiven DP|-Datensätze.');
+                const capturedAt = new Date(now).toISOString();
+                const payload = JSON.stringify({
+                  format: 'DispoLuxBackup',
+                  formatVersion: 1,
+                  build: 'DLB-030AG-1.12.1.26',
+                  capturedAt,
+                  reason,
+                  sourceList: dp30afDataList,
+                  recordCount: rows.length,
+                  retentionHours: 54,
+                  intervalMinutes: 30,
+                  rows
+                }, null, 2);
+                const fileName = dp30afSlotFileName(now);
+                await dp30afUpload(fileName, payload);
+                dp30afLastSuccess = now;
+                dp30afWarn('');
+                dp30afWindow.__DISPOLUX_BACKUP_STATUS = { ok: true, capturedAt, fileName, recordCount: rows.length, reason };
+                try { await dp30afCleanup(now); } catch (e) { console.warn('030AG: Backup-Aufbewahrung konnte nicht vollständig bereinigt werden.', e); }
+                console.info(`DispoLux Backup ${fileName}: ${rows.length} Datensätze · ${reason}`);
+              };
+
+              const dp30afBackup = (reason: string): Promise<void> => {
+                dp30afQueue = dp30afQueue.catch(() => undefined).then(async (): Promise<void> => {
+                  try {
+                    await dp30afDoBackup(reason);
+                  } catch (e) {
+                    const msg = String((e as any)?.message || e || 'unbekannter Fehler');
+                    dp30afWindow.__DISPOLUX_BACKUP_STATUS = { ok: false, failedAt: new Date().toISOString(), reason, message: msg };
+                    dp30afWarn('DATENSICHERUNG FEHLGESCHLAGEN – ' + msg);
+                    console.error('030AG DispoLux Dateisicherung', e);
+                    throw e;
+                  }
+                });
+                return dp30afQueue;
+              };
+
+              const dp30afCloseBackup = (): void => {
+                const now = Date.now();
+                if (now - dp30afLastCloseKick < 5000) return;
+                dp30afLastCloseKick = now;
+                dp30afBackup('Schließen/Verlassen').catch(() => undefined);
+              };
+
+              dp30afWindow.dpDispoLuxBackupNow = (): Promise<void> => dp30afBackup('Manuell');
+              dp30afWindow.dpDispoLuxBackupStatus = (): any => dp30afWindow.__DISPOLUX_BACKUP_STATUS || {
+                ok: null,
+                openedAt: new Date(dp30afOpenedAt).toISOString(),
+                lastSuccess: dp30afLastSuccess ? new Date(dp30afLastSuccess).toISOString() : null
+              };
+
+              // Beim Öffnen nur die Bibliothek vorbereiten; erster Snapshot nach 30 Minuten.
+              dp30afEnsureLibrary().catch((e: unknown) => {
+                const msg = String((e as any)?.message || e || 'unbekannter Fehler');
+                dp30afWarn('DATENSICHERUNG NICHT BEREIT – ' + msg);
+                console.error('030AG Backup-Bibliothek', e);
+              });
+
+              const dp30afFirstTimer = window.setTimeout(() => {
+                dp30afBackup('30-Minuten-Intervall').catch(() => undefined);
+                const timer = window.setInterval(() => {
+                  dp30afBackup('30-Minuten-Intervall').catch(() => undefined);
+                }, dp30afIntervalMs);
+                Object.defineProperty(dp30afWindow, '__DISPOLUX_FILE_BACKUP_030AG_TIMER', { value: timer, writable: true, configurable: true });
+              }, dp30afIntervalMs);
+              Object.defineProperty(dp30afWindow, '__DISPOLUX_FILE_BACKUP_030AG_FIRST_TIMER', { value: dp30afFirstTimer, writable: true, configurable: true });
+
+              // Browser-Schließen ist nicht erzwingbar: hidden startet früh, pagehide ist die zweite Chance.
+              document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'hidden') {
+                  dp30afCloseBackup();
+                } else if (Date.now() - dp30afOpenedAt >= dp30afIntervalMs && (!dp30afLastSuccess || Date.now() - dp30afLastSuccess >= dp30afIntervalMs)) {
+                  dp30afBackup('Rückkehr nach Pause').catch(() => undefined);
+                }
+              });
+              window.addEventListener('pagehide', () => dp30afCloseBackup());
+            }
+            /* DP_DLB_030AG_1_12_1_26_BACKUP_30MIN_FILES_END */
+          '''
+
+          s = s.replace(old_end, old_end + "\n" + patch, 1)
+          p.write_text(s, encoding="utf-8", newline="\n")
+          print("030AG gepatcht:", p)
+          PY_PATCH_030AG
+
+      - name: Set 030AG SPFx version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VER_030AG'
+          from pathlib import Path
+          p = Path("spfx-build/config/package-solution.json")
+          s = p.read_text(encoding="utf-8")
+          if "1.3.6.89" not in s:
+              raise SystemExit("030AG: erwartete 030AE-SPFx-Version 1.3.6.89 fehlt.")
+          p.write_text(s.replace("1.3.6.89", "1.3.6.91", 1), encoding="utf-8", newline="\n")
+          PY_VER_030AG
+
+      - name: Validate 030AG source before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -R -Fq 'DP_DLB_030J_1_12_1_3_ORDERS_DIREKT_SYNC_BEGIN' spfx-build/src/webparts
+          grep -R -Fq 'DP_DLB_030AE_1_12_1_24_DPB_AUS_DP_DATA_ENTFERNT_BEGIN' spfx-build/src/webparts
+          grep -R -Fq 'DP_DLB_030AG_1_12_1_26_BACKUP_30MIN_FILES_BEGIN' spfx-build/src/webparts
+          grep -R -Fq "const dp30afLibrary = 'DispoLux_Backup';" spfx-build/src/webparts
+          grep -R -Fq 'const dp30afIntervalMs = 30 * 60 * 1000;' spfx-build/src/webparts
+          grep -R -Fq 'const dp30afRetentionMs = 54 * 60 * 60 * 1000;' spfx-build/src/webparts
+          grep -R -Fq "dp30afBackup('Schließen/Verlassen')" spfx-build/src/webparts
+          grep -R -Fq "dp30afBackup('30-Minuten-Intervall')" spfx-build/src/webparts
+          grep -R -Fq 'overwrite=true' spfx-build/src/webparts
+          ! grep -R -Fq 'await dp28dBackup(fields, rows, force);' spfx-build/src/webparts
+          grep -Fq '1.3.6.91' spfx-build/config/package-solution.json
+
+      - name: Build and package 030AG
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd spfx-build && npx heft build --production)
+          (cd spfx-build && npx heft package-solution --production)
+
+          rm -rf artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n1)
+          test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          if [ -d spfx-build/release/assets ]; then
+            cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d spfx-build/temp/deploy ]; then
+            cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else
+            echo "030AG: Keine SPFx Asset-Ausgabe gefunden." >&2
+            exit 1
+          fi
+
+          if [ -f .dpx14_icon_b64 ]; then
+            python3 - <<'PY_ICON_030AG'
+          from pathlib import Path
+          import base64
+          Path("artifact/UPLOAD_TO_SITEASSETS/DispoLux_DL_Icon_48.png").write_bytes(base64.b64decode(Path(".dpx14_icon_b64").read_text().strip()))
+          PY_ICON_030AG
+          fi
+
+      - name: Validate emitted 030AG package
+        shell: bash
+        run: |
+          set -euo pipefail
+          JS=$(find artifact/UPLOAD_TO_SITEASSETS -maxdepth 1 -type f -name '*.js' | head -n1)
+          test -n "$JS"
+          node --check "$JS"
+          grep -Fq 'DP|orders|' "$JS"
+          grep -Fq 'dp030jLoadOrdersDirect' "$JS"
+          grep -Fq 'DispoLux_Backup' "$JS"
+          grep -Fq 'DP_Data_' "$JS"
+          grep -Fq '__DISPOLUX_FILE_BACKUP_030AG' "$JS"
+          grep -Fq 'dpDispoLuxBackupNow' "$JS"
+          grep -Fq '30-Minuten-Intervall' "$JS"
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DLB-030AG-1.12.1.26 · 30-MINUTEN DATEISICHERUNG · SPFx 1.3.6.91
+
+          Basis: DLB-030AE-1.12.1.24.
+
+          - DP_Data bleibt frei von DPB|-Datensätzen.
+          - Separate Dokumentbibliothek: DispoLux_Backup.
+          - Erstes Backup 30 Minuten nach Öffnen, danach alle 30 Minuten solange DispoLux läuft.
+          - Beim Schließen/Verlassen zusätzliche bestmögliche Abschlusssicherung.
+          - Rückkehr nach längerer Pause holt ein überfälliges Backup nach.
+          - Ein Backup = eine JSON-Datei mit allen produktiven DP|-Datensätzen.
+          - Mehrere Benutzer verwenden pro 30-Minuten-Zeitfenster denselben Dateinamen; dadurch keine Dateiflut durch parallele Sitzungen.
+          - Aufbewahrung mindestens 54 Stunden; ältere Backup-Dateien werden nach erfolgreicher Sicherung entfernt.
+          - Versionsverwaltung der Backup-Bibliothek wird nach Möglichkeit deaktiviert.
+          - Manuelles Backup: window.dpDispoLuxBackupNow().
+
+          Wichtig: Eine Abschlusssicherung beim harten Browser-/Tablet-Abbruch kann der Browser nicht garantieren. Das 30-Minuten-Intervall bleibt die verlässliche Schutzlinie.
+
+          Installation wie bisher:
+          1. UPLOAD_TO_SITEASSETS
+          2. UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+          3. DispoLux auf allen Geräten/Tabs vollständig schließen und frisch öffnen.
+          TXT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-030AG-1.12.1.26-BACKUP-30MIN-FILES-SPFX-1.3.6.91
+          path: artifact/
+          if-no-files-found: error
