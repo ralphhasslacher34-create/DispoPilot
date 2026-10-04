@@ -1,0 +1,133 @@
+name: DLB-032C-1.16.0.9 FAHRERAUSWAHL STABIL FULL BUILD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Build DLB-032C from DLB-032B source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+
+          python3 - <<'PY_RUN_032C'
+          from pathlib import Path
+          import base64
+          import re
+          import subprocess
+          import textwrap
+          import yaml
+
+          source = Path(".github/workflows/DLB-032B-1.16.0.8_FAHRERAUSWAHL_STABIL_FULL_BUILD.yml")
+          if not source.exists():
+              raise SystemExit("032C: 032B-Quellworkflow fehlt im Repository.")
+
+          text = source.read_text(encoding="utf-8")
+
+          # 1) Den eigentlichen Fehler aus 032B korrigieren:
+          #    Validator suchte 1.16.0.7, der Patch war bereits 1.16.0.8.
+          wrong = "DP_DLB_032B_1_16_0_7_TD005_FAHRERAUSWAHL"
+          correct_b = "DP_DLB_032B_1_16_0_8_TD005_FAHRERAUSWAHL"
+          wrong_count = text.count(wrong)
+          if wrong_count != 4:
+              raise SystemExit(
+                  f"032C: erwartet genau 4 falsche 032B-Prüfmarker, gefunden {wrong_count}. "
+                  "Abbruch statt ungeprüftem Build."
+              )
+          text = text.replace(wrong, correct_b)
+
+          # 2) Eingebetteten 032B-Patch wirklich auf 032C / 1.16.0.9 anheben.
+          block_re = re.compile(
+              r"(cat > /tmp/dlb032b_patch\.b64 <<'DLB032B_PATCH'\n)"
+              r"(?P<b64>.*?)"
+              r"(\n\s*DLB032B_PATCH)",
+              re.S,
+          )
+          m = block_re.search(text)
+          if not m:
+              raise SystemExit("032C: eingebetteter 032B-Patchblock nicht gefunden.")
+
+          raw_b64 = re.sub(r"\s+", "", m.group("b64"))
+          patch = base64.b64decode(raw_b64).decode("utf-8")
+
+          old_begin = "DP_DLB_032B_1_16_0_8_TD005_FAHRERAUSWAHL_BEGIN"
+          old_end   = "DP_DLB_032B_1_16_0_8_TD005_FAHRERAUSWAHL_END"
+          new_begin = "DP_DLB_032C_1_16_0_9_TD005_FAHRERAUSWAHL_BEGIN"
+          new_end   = "DP_DLB_032C_1_16_0_9_TD005_FAHRERAUSWAHL_END"
+
+          if patch.count(old_begin) != 1 or patch.count(old_end) != 1:
+              raise SystemExit("032C: 032B-Patchmarker im eingebetteten Patch nicht eindeutig.")
+
+          patch = patch.replace(old_begin, new_begin)
+          patch = patch.replace(old_end, new_end)
+          patch = patch.replace("version:'1.16.0.8'", "version:'1.16.0.9'")
+
+          new_b64 = base64.b64encode(patch.encode("utf-8")).decode("ascii")
+          wrapped = "\n".join("          " + line for line in textwrap.wrap(new_b64, 76))
+          text = text[:m.start("b64")] + wrapped + text[m.end("b64"):]
+
+          # 3) Klare Build-/Validierungskennungen auf die neue eindeutige Nummer heben.
+          text = text.replace(
+              "DP_DLB_032B_1_16_0_8_TD005_FAHRERAUSWAHL",
+              "DP_DLB_032C_1_16_0_9_TD005_FAHRERAUSWAHL",
+          )
+          text = text.replace("DLB-032B", "DLB-032C")
+          text = text.replace("032B", "032C")
+          text = text.replace("1.16.0.8", "1.16.0.9")
+          text = text.replace("1.3.6.102", "1.3.6.103")
+
+          # Nach dem globalen 032B -> 032C wurden auch Here-Doc-Bezeichner umbenannt.
+          # Der temporäre Dateipfad bleibt absichtlich klein geschrieben und ist intern belanglos.
+
+          # 4) Sicherheitsprüfung vor Ausführung.
+          if wrong in text:
+              raise SystemExit("032C: alter falscher 1.16.0.7-Prüfmarker ist noch vorhanden.")
+          if new_begin not in text or new_end not in text:
+              raise SystemExit("032C: neue 032C-Patchmarker fehlen im Workflow.")
+          if "1.3.6.103" not in text:
+              raise SystemExit("032C: SPFx-Version 1.3.6.103 fehlt.")
+
+          doc = yaml.safe_load(text)
+          steps = doc["jobs"]["build"]["steps"]
+          run_steps = [(s.get("name", ""), s.get("run")) for s in steps if s.get("run")]
+
+          if not run_steps:
+              raise SystemExit("032C: keine ausführbaren Buildschritte gefunden.")
+
+          print("032C: Nummerierung geprüft: DLB-032C / Produkt 1.16.0.9 / SPFx 1.3.6.103")
+          print("032C: 4 fehlerhafte Validator-Marker aus 032B korrigiert.")
+          print(f"032C: {len(run_steps)} Original-Buildschritte werden ausgeführt.")
+
+          for idx, (name, script) in enumerate(run_steps, 1):
+              print(f"\n===== 032C Schritt {idx}/{len(run_steps)}: {name} =====")
+              runner = Path(f".032c_step_{idx}.sh")
+              runner.write_text(script, encoding="utf-8", newline="\n")
+              try:
+                  subprocess.run(["bash", "-euo", "pipefail", str(runner)], check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+
+          print("\n032C: Build- und Validierungsschritte erfolgreich abgeschlossen.")
+          PY_RUN_032C
+
+      - name: Upload DLB-032C artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-032C-1.16.0.9-FAHRERAUSWAHL-STABIL-SPFX-1.3.6.103
+          path: artifact/
+          if-no-files-found: error
