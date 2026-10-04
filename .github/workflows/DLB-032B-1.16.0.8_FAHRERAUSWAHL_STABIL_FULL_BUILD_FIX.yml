@@ -1,0 +1,95 @@
+name: DLB-032B-1.16.0.8 FAHRERAUSWAHL STABIL FULL BUILD FIX
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Run corrected DLB-032B
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --quiet pyyaml
+
+          python3 - <<'PY_RUN_FIXED_032B'
+          from pathlib import Path
+          import subprocess
+          import yaml
+
+          source = Path(".github/workflows/DLB-032B-1.16.0.8_FAHRERAUSWAHL_STABIL_FULL_BUILD.yml")
+          if not source.exists():
+              raise SystemExit(
+                  "032B FIX: Ursprüngliche DLB-032B Workflow-Datei fehlt im Repository."
+              )
+
+          text = source.read_text(encoding="utf-8")
+
+          old = "DP_DLB_032B_1_16_0_7_TD005_FAHRERAUSWAHL"
+          new = "DP_DLB_032B_1_16_0_8_TD005_FAHRERAUSWAHL"
+
+          count = text.count(old)
+          if count != 4:
+              raise SystemExit(
+                  f"032B FIX: Erwartete genau 4 falsche 1.16.0.7-Prüfmarker, gefunden: {count}. "
+                  "Abbruch, damit nichts Ungeprüftes gebaut wird."
+              )
+
+          fixed = text.replace(old, new)
+
+          if old in fixed:
+              raise SystemExit("032B FIX: Alter 1.16.0.7-Prüfmarker ist nach Korrektur noch vorhanden.")
+
+          # Der eingebettete eigentliche 032B-Patch verwendet bereits 1.16.0.8.
+          begin = "DP_DLB_032B_1_16_0_8_TD005_FAHRERAUSWAHL_BEGIN"
+          end = "DP_DLB_032B_1_16_0_8_TD005_FAHRERAUSWAHL_END"
+          if begin not in fixed or end not in fixed:
+              raise SystemExit("032B FIX: Erwartete 1.16.0.8-Marker fehlen nach der Korrektur.")
+
+          doc = yaml.safe_load(fixed)
+          steps = doc["jobs"]["build"]["steps"]
+
+          run_steps = []
+          for step in steps:
+              script = step.get("run")
+              if script:
+                  run_steps.append((step.get("name", "ohne Name"), script))
+
+          if not run_steps:
+              raise SystemExit("032B FIX: Keine ausführbaren Build-Schritte im 032B-Workflow gefunden.")
+
+          print(f"032B FIX: 4 falsche Prüfmarker 1.16.0.7 -> 1.16.0.8 korrigiert.")
+          print(f"032B FIX: {len(run_steps)} Build-Schritte werden ausgeführt.")
+
+          for idx, (name, script) in enumerate(run_steps, 1):
+              print(f"\n===== 032B FIX Schritt {idx}/{len(run_steps)}: {name} =====")
+              runner = Path(f".032b_fixed_step_{idx}.sh")
+              runner.write_text(script, encoding="utf-8", newline="\n")
+              try:
+                  subprocess.run(["bash", "-euo", "pipefail", str(runner)], check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+
+          print("\n032B FIX: Alle Build- und Validierungsschritte erfolgreich abgeschlossen.")
+          PY_RUN_FIXED_032B
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-032B-1.16.0.8-FAHRERAUSWAHL-STABIL-FIX-SPFX-1.3.6.102
+          path: artifact/
+          if-no-files-found: error
