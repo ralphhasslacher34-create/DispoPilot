@@ -1,0 +1,428 @@
+name: DLB-033A-1.16.0.12 STELLEN MATERIAL FULL BUILD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Prepare and run DLB-033A
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY_RUN_033A'
+          from pathlib import Path
+          import base64
+          import re
+          import subprocess
+          import textwrap
+          import yaml
+
+          source = Path(".github/workflows/DLB-032B-1.16.0.8_FAHRERAUSWAHL_STABIL_FULL_BUILD.yml")
+          if not source.exists():
+              raise SystemExit("033A: 032B-Quellworkflow für die bestätigte 032E-Basis fehlt.")
+
+          text = source.read_text(encoding="utf-8")
+
+          wrong = "DP_DLB_032B_1_16_0_7_TD005_FAHRERAUSWAHL"
+          base_marker = "DP_DLB_032B_1_16_0_8_TD005_FAHRERAUSWAHL"
+          e_marker = "DP_DLB_032E_1_16_0_11_TD005_FAHRERAUSWAHL"
+
+          count = text.count(wrong)
+          if count != 4:
+              raise SystemExit(f"033A: erwartet genau 4 alte 032B-Prüfmarker, gefunden {count}.")
+          text = text.replace(wrong, base_marker)
+
+          block_re = re.compile(
+              r"(cat > /tmp/dlb032b_patch\.b64 <<'DLB032B_PATCH'\n)"
+              r"(?P<b64>.*?)"
+              r"(\n\s*DLB032B_PATCH)",
+              re.S,
+          )
+          m = block_re.search(text)
+          if not m:
+              raise SystemExit("033A: eingebetteter 032B-Fahrerauswahl-Patch nicht gefunden.")
+
+          raw_b64 = re.sub(r"\s+", "", m.group("b64"))
+          driver_patch = base64.b64decode(raw_b64).decode("utf-8")
+          old_begin = base_marker + "_BEGIN"
+          old_end = base_marker + "_END"
+          e_begin = e_marker + "_BEGIN"
+          e_end = e_marker + "_END"
+
+          if driver_patch.count(old_begin) != 1 or driver_patch.count(old_end) != 1:
+              raise SystemExit("033A: 032B-Patchmarker nicht eindeutig.")
+
+          driver_patch = driver_patch.replace(old_begin, e_begin)
+          driver_patch = driver_patch.replace(old_end, e_end)
+          driver_patch = driver_patch.replace("version:'1.16.0.8'", "version:'1.16.0.11'")
+          driver_patch = driver_patch.replace("__DISPOLUX_032B", "__DISPOLUX_032E")
+
+          driver_functions = [
+              "dp32BInstallDriverPicker",
+              "dp32BDriverButton",
+              "dp32BDriverMenu",
+              "dp32BSelectDriver",
+              "dp32BBaseFillSelects",
+              "dp32BBaseOpenM",
+          ]
+          missing = [x for x in driver_functions if x not in driver_patch]
+          if missing:
+              raise SystemExit("033A: 032E-Fahrerauswahl unvollständig: " + ", ".join(missing))
+
+          new_b64 = base64.b64encode(driver_patch.encode("utf-8")).decode("ascii")
+          wrapped = "\n".join("          " + line for line in textwrap.wrap(new_b64, 76))
+          text = text[:m.start("b64")] + wrapped + text[m.end("b64"):]
+
+          text = text.replace(base_marker, e_marker)
+          text = text.replace(
+              "name: DLB-032B-1.16.0.8 FAHRERAUSWAHL STABIL FULL BUILD PROD",
+              "name: DLB-033A-1.16.0.12 STELLEN MATERIAL FULL BUILD",
+          )
+          text = text.replace("- name: Set 032B SPFx version", "- name: Set 032E SPFx version")
+          text = text.replace(
+              "- name: Validate 032B Fahrerauswahl before build",
+              "- name: Validate 032E Fahrerauswahl before build",
+          )
+          text = text.replace("- name: Build and package 032B", "- name: Build and package 033A")
+          text = text.replace(
+              "- name: Validate emitted 032B package",
+              "- name: Validate emitted 033A package",
+          )
+          text = text.replace("DLB-032B-1.16.0.8", "DLB-032E-1.16.0.11")
+          text = text.replace("1.16.0.8", "1.16.0.11")
+          text = text.replace("1.3.6.102", "1.3.6.105")
+          text = text.replace("__DISPOLUX_032B", "__DISPOLUX_032E")
+          text = text.replace("032B VALIDIERUNG", "032E VALIDIERUNG")
+          text = text.replace("OK 1/10: 032B-Patch", "OK 1/10: 032E-Patch")
+          text = text.replace("OK 10/10: 032B eindeutig", "OK 10/10: 032E eindeutig")
+          text = text.replace("032B Fahrerauswahl gepatcht:", "032E Fahrerauswahl gepatcht:")
+
+          fragile_line = (
+              "          grep -R -Fq "
+              f"'{e_marker}_BEGIN' "
+              "artifact/UPLOAD_TO_SITEASSETS\n"
+          )
+          if fragile_line not in text:
+              raise SystemExit("033A: erwartete alte Markerprüfung nicht gefunden.")
+          text = text.replace(fragile_line, "", 1)
+
+          final_driver_anchor = "          grep -R -Fq 'dp32BDriverButton' artifact/UPLOAD_TO_SITEASSETS\n"
+          if final_driver_anchor not in text:
+              raise SystemExit("033A: robuste 032E-Fahrerprüfung fehlt.")
+
+          doc = yaml.safe_load(text)
+          steps = doc["jobs"]["build"]["steps"]
+          build_index = next((i for i,s in enumerate(steps) if s.get("name")=="Build and package 033A"), None)
+          if build_index is None:
+              raise SystemExit("033A: Build-Schritt konnte nicht gefunden werden.")
+
+          apply_033 = """set -euo pipefail
+
+          cat > /tmp/dlb033a_patch.b64 <<'DLB033A_PATCH'
+          __PATCH_B64__
+          DLB033A_PATCH
+
+          python3 - <<'PY_PATCH_033A'
+          from pathlib import Path
+          import base64
+
+          files = (
+              list(Path("spfx-build/src/webparts").rglob("*.js")) +
+              list(Path("spfx-build/src/webparts").rglob("*.ts")) +
+              list(Path("spfx-build/src/webparts").rglob("*.tsx"))
+          )
+          end_marker = "/* DP13_PATCH_END */"
+          base_marker = "DP_DLB_032E_1_16_0_11_TD005_FAHRERAUSWAHL_BEGIN"
+          new_marker = "DP_DLB_033A_1_16_0_12_STELLEN_MATERIAL_BEGIN"
+
+          candidates=[]
+          for p in files:
+              src=p.read_text(encoding="utf-8")
+              if (
+                  base_marker in src
+                  and end_marker in src
+                  and "function dpR1MaterialOptions" in src
+                  and "function editOrder" in src
+                  and "function saveOrder" in src
+                  and "function orderCard" in src
+                  and "function openDetail" in src
+              ):
+                  candidates.append(p)
+
+          if len(candidates)!=1:
+              raise SystemExit(
+                  "033A: erwartete genau eine 032E-Runtime mit Stellen/Material-Logik, gefunden: "
+                  + str([str(x) for x in candidates])
+              )
+
+          p=candidates[0]
+          src=p.read_text(encoding="utf-8")
+          if new_marker in src:
+              raise SystemExit("033A: Patch bereits vorhanden.")
+          if src.count(end_marker)!=1:
+              raise SystemExit(f"033A: DP13-Endmarker {src.count(end_marker)}x statt 1x.")
+
+          patch=base64.b64decode(Path("/tmp/dlb033a_patch.b64").read_text().encode()).decode("utf-8")
+          src=src.replace(end_marker,patch+"\\n\\n"+end_marker,1)
+          p.write_text(src,encoding="utf-8",newline="\\n")
+          print("033A Stellen/Material gepatcht:",p)
+          PY_PATCH_033A
+          """.replace("__PATCH_B64__", """__PATCH_B64_RUNTIME__""")
+
+          set_ver_033 = """set -euo pipefail
+          python3 - <<'PY_VER_033A'
+          from pathlib import Path
+          p=Path("spfx-build/config/package-solution.json")
+          src=p.read_text(encoding="utf-8")
+          if "1.3.6.105" not in src:
+              raise SystemExit("033A: erwartete 032E-SPFx-Version 1.3.6.105 fehlt.")
+          p.write_text(src.replace("1.3.6.105","1.3.6.106",1),encoding="utf-8",newline="\\n")
+          PY_VER_033A
+          """
+
+          validate_033 = """set -euo pipefail
+          python3 - <<'PY_VALIDATE_033A'
+          from pathlib import Path
+          import json
+          import subprocess
+
+          root=Path("spfx-build/src/webparts")
+          files=[p for p in root.rglob("*") if p.is_file() and p.suffix in {".js",".ts",".tsx"}]
+          begin="DP_DLB_033A_1_16_0_12_STELLEN_MATERIAL_BEGIN"
+          end="DP_DLB_033A_1_16_0_12_STELLEN_MATERIAL_END"
+          hits=[]
+          for p in files:
+              src=p.read_text(encoding="utf-8")
+              if begin in src:
+                  hits.append((p,src))
+          if len(hits)!=1:
+              raise SystemExit(f"033A VALIDIERUNG: Patch in {len(hits)} Dateien statt genau 1 gefunden: {[str(p) for p,_ in hits]}")
+
+          runtime,src=hits[0]
+          if end not in src:
+              raise SystemExit("033A VALIDIERUNG: Endmarker fehlt.")
+          frag=src.split(begin,1)[1].split(end,1)[0]
+
+          required=[
+              "dp33StellenMaterialOptions",
+              "dp33SetStellenMaterial",
+              "dp33BaseTaskChanged",
+              "dp33BaseEditOrder",
+              "dp33BaseSaveOrder",
+              "dp33BaseOrderCard",
+              "dp33BaseOpenDetail",
+              "Geplantes Material",
+              '<option value="">Leer</option>',
+              "state?.materials",
+              "targetTask==='Stellen'",
+              "dp33SetStellenMaterial('')",
+              "dp33DisplayMaterial",
+              "dp33StellenMaterialDetail",
+              "__DISPOLUX_033A",
+          ]
+          missing=[x for x in required if x not in frag]
+          if missing:
+              raise SystemExit("033A VALIDIERUNG: Pflichtbestandteile fehlen: "+", ".join(missing))
+
+          forbidden=[
+              "$('oMaterial').value='Leer'",
+              'o.material="Leer"',
+              "o.material='Leer'",
+              "state.materials.push('Leer')",
+              'state.materials.push("Leer")',
+          ]
+          bad=[x for x in forbidden if x in frag]
+          if bad:
+              raise SystemExit("033A VALIDIERUNG: Leer darf nicht als echter Muldeninhalt gespeichert werden: "+", ".join(bad))
+
+          if "DP_DLB_032E_1_16_0_11_TD005_FAHRERAUSWAHL_BEGIN" not in src:
+              raise SystemExit("033A VALIDIERUNG: bestätigte 032E-Fahrerauswahl fehlt.")
+          if "DP_DLB_031G_1_16_0_6_STANDORTE_NAVIGATION_BEGIN" not in src:
+              raise SystemExit("033A VALIDIERUNG: 031G Standort-/Navigationsbasis fehlt.")
+          for marker in ["dp32BDriverButton","dp31GRenderBinMap","Standort setzen","Navigation zur Baustelle"]:
+              if marker not in src:
+                  raise SystemExit("033A VALIDIERUNG: bestehende Funktion fehlt: "+marker)
+
+          pkg=Path("spfx-build/config/package-solution.json")
+          data=json.loads(pkg.read_text(encoding="utf-8"))
+          version=data.get("solution",{}).get("version","")
+          if version!="1.3.6.106":
+              raise SystemExit(f"033A VALIDIERUNG: SPFx-Version {version!r} statt 1.3.6.106")
+          if runtime.suffix==".js":
+              subprocess.run(["node","--check",str(runtime)],check=True)
+          if src.count(begin)!=1 or src.count(end)!=1:
+              raise SystemExit("033A VALIDIERUNG: Patchmarker nicht eindeutig.")
+          print("033A VALIDIERUNG OK")
+          PY_VALIDATE_033A
+          """
+
+          apply_033 = apply_033.replace("__PATCH_B64_RUNTIME__", """LyogRFBfRExCXzAzM0FfMV8xNl8wXzEyX1NURUxMRU5fTUFURVJJQUxfQkVHSU4gKi8KKGZ1bmN0
+          aW9uKCl7CiAgaWYod2luZG93Ll9fRElTUE9MVVhfMDMzQT8udmVyc2lvbj09PScxLjE2LjAuMTIn
+          KXJldHVybjsKCiAgZnVuY3Rpb24gZHAzM1RleHQodil7cmV0dXJuIFN0cmluZyh2Pz8nJykudHJp
+          bSgpO30KICBmdW5jdGlvbiBkcDMzVGFzaygpe3JldHVybiBkcDMzVGV4dCgkKCdvVGFzaycpPy52
+          YWx1ZSk7fQogIGZ1bmN0aW9uIGRwMzNJc1N0ZWxsZW4oKXtyZXR1cm4gZHAzM1Rhc2soKT09PSdT
+          dGVsbGVuJzt9CgogIGZ1bmN0aW9uIGRwMzNNYXRlcmlhbExpc3QoKXsKICAgIHRyeXtpZih0eXBl
+          b2YgZHBSMUVuc3VyZVN0YXRlPT09J2Z1bmN0aW9uJylkcFIxRW5zdXJlU3RhdGUoKTt9Y2F0Y2go
+          Xyl7fQogICAgY29uc3Qgc3JjPUFycmF5LmlzQXJyYXkoc3RhdGU/Lm1hdGVyaWFscyk/c3RhdGUu
+          bWF0ZXJpYWxzOltdOwogICAgY29uc3Qgc2Vlbj1uZXcgU2V0KCk7CiAgICBjb25zdCBvdXQ9W107
+          CiAgICBzcmMuZm9yRWFjaChyYXc9PnsKICAgICAgY29uc3QgbmFtZT1kcDMzVGV4dCh0eXBlb2Yg
+          cmF3PT09J3N0cmluZyc/cmF3OnJhdz8ubmFtZSk7CiAgICAgIGlmKCFuYW1lfHxuYW1lLnRvTG9j
+          YWxlTG93ZXJDYXNlKCdkZScpPT09J2xlZXInKXJldHVybjsKICAgICAgY29uc3Qga2V5PW5hbWUu
+          dG9Mb2NhbGVMb3dlckNhc2UoJ2RlJyk7CiAgICAgIGlmKHNlZW4uaGFzKGtleSkpcmV0dXJuOwog
+          ICAgICBzZWVuLmFkZChrZXkpOwogICAgICBvdXQucHVzaChuYW1lKTsKICAgIH0pOwogICAgcmV0
+          dXJuIG91dC5zb3J0KChhLGIpPT5hLmxvY2FsZUNvbXBhcmUoYiwnZGUnKSk7CiAgfQoKICBmdW5j
+          dGlvbiBkcDMzU3RlbGxlbk1hdGVyaWFsT3B0aW9ucyhzZWxlY3RlZD0nJyl7CiAgICBjb25zdCBj
+          dXI9ZHAzM1RleHQoc2VsZWN0ZWQpOwogICAgY29uc3QgbGlzdD1kcDMzTWF0ZXJpYWxMaXN0KCk7
+          CiAgICBsZXQgaHRtbD0nPG9wdGlvbiB2YWx1ZT0iIj5MZWVyPC9vcHRpb24+JzsKICAgIGh0bWwr
+          PWxpc3QubWFwKHg9Pic8b3B0aW9uIHZhbHVlPSInK2VzYyh4KSsnIiAnKyh4PT09Y3VyPydzZWxl
+          Y3RlZCc6JycpKyc+Jytlc2MoeCkrJzwvb3B0aW9uPicpLmpvaW4oJycpOwogICAgaWYoY3VyJiYh
+          bGlzdC5zb21lKHg9Png9PT1jdXIpKXsKICAgICAgaHRtbCs9JzxvcHRpb24gdmFsdWU9IicrZXNj
+          KGN1cikrJyIgc2VsZWN0ZWQ+Jytlc2MoY3VyKSsnPC9vcHRpb24+JzsKICAgIH0KICAgIHJldHVy
+          biBodG1sOwogIH0KCiAgY29uc3QgZHAzM0Jhc2VNYXRlcmlhbE9wdGlvbnM9KHR5cGVvZiBkcFIx
+          TWF0ZXJpYWxPcHRpb25zPT09J2Z1bmN0aW9uJyk/ZHBSMU1hdGVyaWFsT3B0aW9uczpudWxsOwog
+          IGlmKGRwMzNCYXNlTWF0ZXJpYWxPcHRpb25zKXsKICAgIGRwUjFNYXRlcmlhbE9wdGlvbnM9ZnVu
+          Y3Rpb24oc2VsZWN0ZWQ9JycpewogICAgICBpZihkcDMzSXNTdGVsbGVuKCkpcmV0dXJuIGRwMzNT
+          dGVsbGVuTWF0ZXJpYWxPcHRpb25zKHNlbGVjdGVkKTsKICAgICAgcmV0dXJuIGRwMzNCYXNlTWF0
+          ZXJpYWxPcHRpb25zLmFwcGx5KHRoaXMsYXJndW1lbnRzKTsKICAgIH07CiAgfQoKICBmdW5jdGlv
+          biBkcDMzU2V0TWF0ZXJpYWxMYWJlbCgpewogICAgY29uc3QgZmllbGQ9JCgnbWF0ZXJpYWxGaWVs
+          ZCcpOwogICAgaWYoIWZpZWxkKXJldHVybjsKICAgIGNvbnN0IGxhYmVsPWZpZWxkLnF1ZXJ5U2Vs
+          ZWN0b3IoJ2xhYmVsJyk7CiAgICBpZihkcDMzSXNTdGVsbGVuKCkpewogICAgICBmaWVsZC5jbGFz
+          c0xpc3QucmVtb3ZlKCdoaWRkZW4nKTsKICAgICAgZmllbGQuZGF0YXNldC5kcDMzU3RlbGxlbk1h
+          dGVyaWFsPScxJzsKICAgICAgaWYobGFiZWwpbGFiZWwudGV4dENvbnRlbnQ9J0dlcGxhbnRlcyBN
+          YXRlcmlhbCc7CiAgICB9ZWxzZXsKICAgICAgZGVsZXRlIGZpZWxkLmRhdGFzZXQuZHAzM1N0ZWxs
+          ZW5NYXRlcmlhbDsKICAgICAgaWYobGFiZWwmJmxhYmVsLnRleHRDb250ZW50PT09J0dlcGxhbnRl
+          cyBNYXRlcmlhbCcpbGFiZWwudGV4dENvbnRlbnQ9J0luaGFsdCAvIE1hdGVyaWFsJzsKICAgIH0K
+          ICB9CgogIGZ1bmN0aW9uIGRwMzNTZXRTdGVsbGVuTWF0ZXJpYWwodmFsdWU9JycpewogICAgaWYo
+          IWRwMzNJc1N0ZWxsZW4oKSlyZXR1cm47CiAgICB0cnl7aWYodHlwZW9mIGRwUjFJbnN0YWxsT3Jk
+          ZXJVaT09PSdmdW5jdGlvbicpZHBSMUluc3RhbGxPcmRlclVpKCk7fWNhdGNoKF8pe30KICAgIGNv
+          bnN0IHY9ZHAzM1RleHQodmFsdWUpOwogICAgY29uc3Qgc2VsPSQoJ2RwUjFNYXRlcmlhbFNlbGVj
+          dCcpOwogICAgaWYoc2VsKXsKICAgICAgc2VsLmlubmVySFRNTD1kcDMzU3RlbGxlbk1hdGVyaWFs
+          T3B0aW9ucyh2KTsKICAgICAgc2VsLnZhbHVlPXY7CiAgICB9CiAgICBjb25zdCBsZWdhY3k9JCgn
+          b01hdGVyaWFsJyk7CiAgICBpZihsZWdhY3kpbGVnYWN5LnZhbHVlPXY7CiAgICBkcDMzU2V0TWF0
+          ZXJpYWxMYWJlbCgpOwogIH0KCiAgY29uc3QgZHAzM0Jhc2VUYXNrQ2hhbmdlZD10YXNrQ2hhbmdl
+          ZDsKICB0YXNrQ2hhbmdlZD1mdW5jdGlvbigpewogICAgY29uc3QgdGFyZ2V0VGFzaz1kcDMzVGV4
+          dCgkKCdvVGFzaycpPy52YWx1ZSk7CiAgICBjb25zdCByPWRwMzNCYXNlVGFza0NoYW5nZWQuYXBw
+          bHkodGhpcyxhcmd1bWVudHMpOwogICAgZHAzM1NldE1hdGVyaWFsTGFiZWwoKTsKICAgIGlmKHRh
+          cmdldFRhc2s9PT0nU3RlbGxlbicpZHAzM1NldFN0ZWxsZW5NYXRlcmlhbCgnJyk7CiAgICByZXR1
+          cm4gcjsKICB9OwoKICBjb25zdCBkcDMzQmFzZUVkaXRPcmRlcj1lZGl0T3JkZXI7CiAgZWRpdE9y
+          ZGVyPWZ1bmN0aW9uKGlkPW51bGwpewogICAgY29uc3Qgcj1kcDMzQmFzZUVkaXRPcmRlci5hcHBs
+          eSh0aGlzLGFyZ3VtZW50cyk7CiAgICBpZihkcDMzSXNTdGVsbGVuKCkpewogICAgICBjb25zdCBv
+          PShpZCE9PW51bGwmJmlkIT09dW5kZWZpbmVkKT9vcmRlckJ5SWQoaWQpOm51bGw7CiAgICAgIGRw
+          MzNTZXRTdGVsbGVuTWF0ZXJpYWwobz9kcDMzVGV4dChvLm1hdGVyaWFsKTonJyk7CiAgICB9ZWxz
+          ZXsKICAgICAgZHAzM1NldE1hdGVyaWFsTGFiZWwoKTsKICAgIH0KICAgIHJldHVybiByOwogIH07
+          CgogIGNvbnN0IGRwMzNCYXNlU2F2ZU9yZGVyPXNhdmVPcmRlcjsKICBzYXZlT3JkZXI9YXN5bmMg
+          ZnVuY3Rpb24oKXsKICAgIGlmKGRwMzNJc1N0ZWxsZW4oKSl7CiAgICAgIGNvbnN0IHNlbD0kKCdk
+          cFIxTWF0ZXJpYWxTZWxlY3QnKTsKICAgICAgY29uc3Qgdj1kcDMzVGV4dChzZWw/LnZhbHVlfHwn
+          Jyk7CiAgICAgIGlmKCQoJ29NYXRlcmlhbCcpKSQoJ29NYXRlcmlhbCcpLnZhbHVlPXY7CiAgICB9
+          CiAgICByZXR1cm4gYXdhaXQgZHAzM0Jhc2VTYXZlT3JkZXIuYXBwbHkodGhpcyxhcmd1bWVudHMp
+          OwogIH07CgogIGZ1bmN0aW9uIGRwMzNEaXNwbGF5TWF0ZXJpYWwobyl7CiAgICByZXR1cm4gbz8u
+          dGFzaz09PSdTdGVsbGVuJz8oZHAzM1RleHQoby5tYXRlcmlhbCl8fCdMZWVyJyk6ZHAzM1RleHQo
+          bz8ubWF0ZXJpYWwpOwogIH0KCiAgY29uc3QgZHAzM0Jhc2VPcmRlckNhcmQ9b3JkZXJDYXJkOwog
+          IG9yZGVyQ2FyZD1mdW5jdGlvbihvKXsKICAgIGlmKG8/LnRhc2s9PT0nU3RlbGxlbicmJiFkcDMz
+          VGV4dChvLm1hdGVyaWFsKSl7CiAgICAgIHJldHVybiBkcDMzQmFzZU9yZGVyQ2FyZC5jYWxsKHRo
+          aXMsey4uLm8sbWF0ZXJpYWw6ZHAzM0Rpc3BsYXlNYXRlcmlhbChvKX0pOwogICAgfQogICAgcmV0
+          dXJuIGRwMzNCYXNlT3JkZXJDYXJkLmFwcGx5KHRoaXMsYXJndW1lbnRzKTsKICB9OwoKICBjb25z
+          dCBkcDMzQmFzZU9wZW5EZXRhaWw9b3BlbkRldGFpbDsKICBvcGVuRGV0YWlsPWZ1bmN0aW9uKGlk
+          KXsKICAgIGNvbnN0IHI9ZHAzM0Jhc2VPcGVuRGV0YWlsLmFwcGx5KHRoaXMsYXJndW1lbnRzKTsK
+          ICAgIGNvbnN0IG89b3JkZXJCeUlkKGlkKTsKICAgIGlmKG8/LnRhc2s9PT0nU3RlbGxlbicpewog
+          ICAgICBjb25zdCBib2R5PSQoJ2RldGFpbEJvZHknKTsKICAgICAgY29uc3QgY2FyZD1ib2R5Py5x
+          dWVyeVNlbGVjdG9yKCcuY2FyZCcpOwogICAgICBpZihjYXJkKXsKICAgICAgICBjYXJkLnF1ZXJ5
+          U2VsZWN0b3JBbGwoJ1tkYXRhLWRwMzMtc3RlbGxlbi1tYXRlcmlhbC1kZXRhaWxdJykuZm9yRWFj
+          aCh4PT54LnJlbW92ZSgpKTsKICAgICAgICBjb25zdCBleGlzdGluZz1BcnJheS5mcm9tKGNhcmQu
+          Y2hpbGRyZW4pLmZpbmQoeD0+L15JbmhhbHQ6XHMqLy50ZXN0KGRwMzNUZXh0KHgudGV4dENvbnRl
+          bnQpKSk7CiAgICAgICAgaWYoZXhpc3RpbmcpZXhpc3RpbmcucmVtb3ZlKCk7CiAgICAgICAgY29u
+          c3QgbGluZT1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCdkaXYnKTsKICAgICAgICBsaW5lLmRhdGFz
+          ZXQuZHAzM1N0ZWxsZW5NYXRlcmlhbERldGFpbD0nMSc7CiAgICAgICAgbGluZS5pbm5lckhUTUw9
+          JzxzdHJvbmc+R2VwbGFudGVzIE1hdGVyaWFsOjwvc3Ryb25nPiAnK2VzYyhkcDMzRGlzcGxheU1h
+          dGVyaWFsKG8pKTsKICAgICAgICBjYXJkLmFwcGVuZENoaWxkKGxpbmUpOwogICAgICB9CiAgICB9
+          CiAgICByZXR1cm4gcjsKICB9OwoKICB0cnl7CiAgICBkcDMzU2V0TWF0ZXJpYWxMYWJlbCgpOwog
+          ICAgaWYoZHAzM0lzU3RlbGxlbigpJiYhZWRpdGluZ09yZGVySWQpZHAzM1NldFN0ZWxsZW5NYXRl
+          cmlhbCgnJyk7CiAgfWNhdGNoKGUpe2NvbnNvbGUud2FybignRExCLTAzM0EgU3RlbGxlbi9NYXRl
+          cmlhbDonLGUpO30KCiAgd2luZG93Ll9fRElTUE9MVVhfMDMzQT17CiAgICB2ZXJzaW9uOicxLjE2
+          LjAuMTInLAogICAgc2V0U3RlbGxlbk1hdGVyaWFsOmRwMzNTZXRTdGVsbGVuTWF0ZXJpYWwsCiAg
+          ICBtYXRlcmlhbE9wdGlvbnM6ZHAzM1N0ZWxsZW5NYXRlcmlhbE9wdGlvbnMKICB9Owp9KSgpOwov
+          KiBEUF9ETEJfMDMzQV8xXzE2XzBfMTJfU1RFTExFTl9NQVRFUklBTF9FTkQgKi8=""")
+
+          steps[build_index:build_index] = [
+              {"name":"Apply DLB-033A Stellen Material","shell":"bash","run":apply_033},
+              {"name":"Set 033A SPFx version","shell":"bash","run":set_ver_033},
+              {"name":"Validate 033A Stellen Material before build","shell":"bash","run":validate_033},
+          ]
+
+          final_step = next((s for s in steps if s.get("name")=="Validate emitted 033A package"), None)
+          if not final_step:
+              raise SystemExit("033A: finale Paketprüfung fehlt.")
+
+          final_run = final_step["run"]
+          final_run = final_run.replace("DLB-032E-1.16.0.11","DLB-033A-1.16.0.12")
+          final_run = final_run.replace("SPFx 1.3.6.105","SPFx 1.3.6.106")
+          marker = "          grep -R -Fq 'dp32BDriverButton' artifact/UPLOAD_TO_SITEASSETS\n"
+          if marker not in final_run:
+              raise SystemExit("033A: Einfügepunkt für finale Materialprüfung fehlt.")
+          final_run = final_run.replace(
+              marker,
+              marker
+              + "          grep -R -Fq 'Geplantes Material' artifact/UPLOAD_TO_SITEASSETS\n"
+              + "          grep -R -Fq 'dp33StellenMaterialDetail' artifact/UPLOAD_TO_SITEASSETS\n",
+              1,
+          )
+          final_step["run"] = final_run
+
+          names=[s.get("name","") for s in steps]
+          required_order=[
+              "Apply DLB-031G Standorte Navigation",
+              "Validate 031G source before build",
+              "Apply DLB-032B Fahrerauswahl TD-005",
+              "Validate 032E Fahrerauswahl before build",
+              "Apply DLB-033A Stellen Material",
+              "Set 033A SPFx version",
+              "Validate 033A Stellen Material before build",
+              "Build and package 033A",
+              "Validate emitted 033A package",
+          ]
+          positions=[]
+          for name in required_order:
+              if name not in names:
+                  raise SystemExit("033A: erwarteter Schritt fehlt: "+name)
+              positions.append(names.index(name))
+          if positions != sorted(positions):
+              raise SystemExit("033A: Build-Reihenfolge ist nicht korrekt.")
+
+          run_steps=[(s.get("name",""),s.get("run")) for s in steps if s.get("run")]
+          if len(run_steps)!=12:
+              raise SystemExit(f"033A: erwartet 12 ausführbare Buildschritte, gefunden {len(run_steps)}.")
+
+          print("033A Vorprüfung OK")
+          for idx,(name,script) in enumerate(run_steps,1):
+              print(f"===== 033A Schritt {idx}/{len(run_steps)}: {name} =====")
+              runner=Path(f".033a_step_{idx}.sh")
+              runner.write_text(script,encoding="utf-8",newline="\\n")
+              try:
+                  subprocess.run(["bash","-euo","pipefail",str(runner)],check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+          print("033A: kompletter Build und alle Validierungen erfolgreich abgeschlossen.")
+
+          PY_RUN_033A
+
+      - name: Upload DLB-033A artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-033A-1.16.0.12-STELLEN-MATERIAL-SPFX-1.3.6.106
+          path: artifact/
+          if-no-files-found: error
