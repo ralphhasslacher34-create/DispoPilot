@@ -1,0 +1,177 @@
+name: DLB-032E-1.16.0.11 FAHRERAUSWAHL STABIL FULL BUILD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Prepare and run DLB-032E
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+
+          python3 - <<'PY_RUN_032E'
+          from pathlib import Path
+          import base64
+          import re
+          import subprocess
+          import textwrap
+          import yaml
+
+          source = Path(".github/workflows/DLB-032B-1.16.0.8_FAHRERAUSWAHL_STABIL_FULL_BUILD.yml")
+          if not source.exists():
+              raise SystemExit("032E: geprüfte 032B-Quellbasis fehlt.")
+
+          text = source.read_text(encoding="utf-8")
+
+          wrong = "DP_DLB_032B_1_16_0_7_TD005_FAHRERAUSWAHL"
+          base_marker = "DP_DLB_032B_1_16_0_8_TD005_FAHRERAUSWAHL"
+          e_marker = "DP_DLB_032E_1_16_0_11_TD005_FAHRERAUSWAHL"
+
+          count = text.count(wrong)
+          if count != 4:
+              raise SystemExit(
+                  f"032E: Sicherheitsabbruch. Erwartet 4 falsche 032B-Prüfmarker, gefunden {count}."
+              )
+          text = text.replace(wrong, base_marker)
+
+          block_re = re.compile(
+              r"(cat > /tmp/dlb032b_patch\.b64 <<'DLB032B_PATCH'\n)"
+              r"(?P<b64>.*?)"
+              r"(\n\s*DLB032B_PATCH)",
+              re.S,
+          )
+          m = block_re.search(text)
+          if not m:
+              raise SystemExit("032E: eingebetteter Fahrerauswahl-Patch nicht gefunden.")
+
+          raw_b64 = re.sub(r"\s+", "", m.group("b64"))
+          patch = base64.b64decode(raw_b64).decode("utf-8")
+
+          old_begin = base_marker + "_BEGIN"
+          old_end = base_marker + "_END"
+          new_begin = e_marker + "_BEGIN"
+          new_end = e_marker + "_END"
+
+          if patch.count(old_begin) != 1 or patch.count(old_end) != 1:
+              raise SystemExit("032E: Patchmarker im eingebetteten Patch nicht eindeutig.")
+
+          patch = patch.replace(old_begin, new_begin)
+          patch = patch.replace(old_end, new_end)
+          patch = patch.replace("version:'1.16.0.8'", "version:'1.16.0.11'")
+          patch = patch.replace("__DISPOLUX_032B", "__DISPOLUX_032E")
+
+          required_functions = [
+              "dp32BInstallDriverPicker",
+              "dp32BDriverButton",
+              "dp32BDriverMenu",
+              "dp32BSelectDriver",
+              "dp32BBaseFillSelects",
+              "dp32BBaseOpenM",
+          ]
+          missing = [x for x in required_functions if x not in patch]
+          if missing:
+              raise SystemExit("032E: Fahrerauswahl-Funktionen fehlen im Patch: " + ", ".join(missing))
+
+          new_b64 = base64.b64encode(patch.encode("utf-8")).decode("ascii")
+          wrapped = "\n".join("          " + line for line in textwrap.wrap(new_b64, 76))
+          text = text[:m.start("b64")] + wrapped + text[m.end("b64"):]
+
+          text = text.replace(base_marker, e_marker)
+
+          text = text.replace(
+              "name: DLB-032B-1.16.0.8 FAHRERAUSWAHL STABIL FULL BUILD PROD",
+              "name: DLB-032E-1.16.0.11 FAHRERAUSWAHL STABIL FULL BUILD",
+          )
+          text = text.replace("- name: Set 032B SPFx version", "- name: Set 032E SPFx version")
+          text = text.replace(
+              "- name: Validate 032B Fahrerauswahl before build",
+              "- name: Validate 032E Fahrerauswahl before build",
+          )
+          text = text.replace("- name: Build and package 032B", "- name: Build and package 032E")
+          text = text.replace(
+              "- name: Validate emitted 032B package",
+              "- name: Validate emitted 032E package",
+          )
+
+          text = text.replace("DLB-032B-1.16.0.8", "DLB-032E-1.16.0.11")
+          text = text.replace("1.16.0.8", "1.16.0.11")
+          text = text.replace("1.3.6.102", "1.3.6.105")
+          text = text.replace("__DISPOLUX_032B", "__DISPOLUX_032E")
+          text = text.replace("032B VALIDIERUNG", "032E VALIDIERUNG")
+          text = text.replace("OK 1/10: 032B-Patch", "OK 1/10: 032E-Patch")
+          text = text.replace("OK 10/10: 032B eindeutig", "OK 10/10: 032E eindeutig")
+          text = text.replace("032B Fahrerauswahl gepatcht:", "032E Fahrerauswahl gepatcht:")
+
+          # Kommentar-Marker werden im Produktionsbundle entfernt.
+          # Deshalb diese eine ungeeignete Endprüfung gezielt löschen.
+          fragile_line = (
+              "          grep -R -Fq "
+              f"'{e_marker}_BEGIN' "
+              "artifact/UPLOAD_TO_SITEASSETS\n"
+          )
+          if fragile_line not in text:
+              raise SystemExit("032E: erwartete fragile Markerprüfung wurde nicht gefunden.")
+          text = text.replace(fragile_line, "", 1)
+
+          # Die echte Fahrer-Picker-Prüfung muss erhalten bleiben.
+          final_anchor = "          grep -R -Fq 'dp32BDriverButton' artifact/UPLOAD_TO_SITEASSETS\n"
+          if final_anchor not in text:
+              raise SystemExit("032E: robuste Fahrer-Picker-Prüfung fehlt.")
+
+          if wrong in text:
+              raise SystemExit("032E: alter 1.16.0.7-Prüfmarker ist noch vorhanden.")
+          if e_marker + "_BEGIN" not in text or e_marker + "_END" not in text:
+              raise SystemExit("032E: neue 032E-Quellmarker fehlen.")
+          for fn in required_functions:
+              if fn not in text:
+                  raise SystemExit("032E: getestete dp32B-Funktion fehlt: " + fn)
+          if "1.3.6.105" not in text:
+              raise SystemExit("032E: SPFx-Version 1.3.6.105 fehlt.")
+
+          doc = yaml.safe_load(text)
+          steps = doc["jobs"]["build"]["steps"]
+          run_steps = [(s.get("name", ""), s.get("run")) for s in steps if s.get("run")]
+          if len(run_steps) != 9:
+              raise SystemExit(f"032E: erwartet 9 Buildschritte, gefunden {len(run_steps)}.")
+
+          print("032E Vorprüfung OK")
+          print("- DLB-032E / Produkt 1.16.0.11 / SPFx 1.3.6.105")
+          print("- 4 falsche 1.16.0.7-Marker korrigiert")
+          print("- dp32B-Funktionsnamen unverändert")
+          print("- fragile Kommentar-Markerprüfung im Produktionsbundle entfernt")
+          print("- finale Prüfung nutzt realen Fahrer-Picker-String")
+
+          for idx, (name, script) in enumerate(run_steps, 1):
+              print(f"\n===== 032E Schritt {idx}/{len(run_steps)}: {name} =====")
+              runner = Path(f".032e_step_{idx}.sh")
+              runner.write_text(script, encoding="utf-8", newline="\n")
+              try:
+                  subprocess.run(["bash", "-euo", "pipefail", str(runner)], check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+
+          print("\n032E: Build und Validierung erfolgreich abgeschlossen.")
+          PY_RUN_032E
+
+      - name: Upload DLB-032E artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-032E-1.16.0.11-FAHRERAUSWAHL-STABIL-SPFX-1.3.6.105
+          path: artifact/
+          if-no-files-found: error
