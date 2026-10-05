@@ -1,0 +1,426 @@
+name: DLB-034B-1.16.0.15 DP DATA STAMMDATEN PERSISTENZ FULL BUILD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Rebuild exact DLB-033C basis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY_RUN_033C_BASE'
+          from pathlib import Path
+          import subprocess
+          import yaml
+
+          wf=Path(".github/workflows/DLB-033C-1.16.0.14_STELLEN_MATERIAL_FULL_BUILD.yml")
+          if not wf.exists():
+              raise SystemExit("034B: erfolgreicher 033C-Workflow fehlt im Repository.")
+
+          doc=yaml.safe_load(wf.read_text(encoding="utf-8"))
+          runs=[(s.get("name",""),s.get("run")) for s in doc["jobs"]["build"]["steps"] if s.get("run")]
+          if not runs:
+              raise SystemExit("034B: keine ausführbaren 033C-Buildschritte gefunden.")
+
+          for idx,(name,script) in enumerate(runs,1):
+              print(f"===== 034B Basis 033C Schritt {idx}/{len(runs)}: {name} =====")
+              runner=Path(f".034b_033c_step_{idx}.sh")
+              runner.write_text(script,encoding="utf-8",newline="\n")
+              try:
+                  subprocess.run(["bash","-euo","pipefail",str(runner)],check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+
+          print("034B: erfolgreicher 033C-Stand vollständig rekonstruiert.")
+          PY_RUN_033C_BASE
+
+      - name: Apply DLB-034B DP Data master-data persistence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH_034B'
+          from pathlib import Path
+          import re
+
+          root=Path("spfx-build/src/webparts")
+          files=[p for p in root.rglob("*") if p.is_file() and p.suffix in {".js",".ts",".tsx"}]
+
+          base_marker="DP_DLB_033C_1_16_0_14_STELLEN_MATERIAL_BEGIN"
+          new_marker="DP_DLB_034B_1_16_0_15_DP_DATA_STAMMDATEN_PERSISTENZ_BEGIN"
+          end_marker="/* DP13_PATCH_END */"
+
+          # 1) 033C-App-Runtime unabhängig vom SharePoint-Wrapper finden.
+          runtime_hits=[]
+          for p in files:
+              src=p.read_text(encoding="utf-8")
+              if base_marker in src and end_marker in src:
+                  runtime_hits.append((p,src))
+          if len(runtime_hits)!=1:
+              raise SystemExit(
+                  "034B: erwartete genau eine 033C-App-Runtime, gefunden: "
+                  + str([str(p) for p,_ in runtime_hits])
+              )
+
+          runtime,src=runtime_hits[0]
+          if new_marker in src:
+              raise SystemExit("034B: Patch bereits vorhanden.")
+          if src.count(end_marker)!=1:
+              raise SystemExit(f"034B: DP13-Endmarker {src.count(end_marker)}x statt 1x.")
+
+          # 2) Zentralen SPStore getrennt suchen. Keine Annahme mehr,
+          #    dass 028D/Wrapper-Code in derselben Datei liegt.
+          section_re=re.compile(r"sectionKeys\s*:\s*\[(?P<body>[^\]]*)\]")
+          store_hits=[]
+          for p in files:
+              s=p.read_text(encoding="utf-8")
+              matches=list(section_re.finditer(s))
+              if matches:
+                  store_hits.append((p,s,matches))
+
+          total_matches=sum(len(m) for _,_,m in store_hits)
+          if total_matches!=1:
+              raise SystemExit(
+                  "034B: sectionKeys muss genau einmal vorhanden sein; "
+                  f"gefunden {total_matches} Treffer in "
+                  + str([str(p) for p,_,_ in store_hits])
+              )
+
+          store_path,store_src,matches=store_hits[0]
+          m=matches[0]
+          body=m.group("body")
+          for required in ("drivers","vehicles","customers","sites","settings"):
+              if required not in body:
+                  raise SystemExit("034B: sectionKeys-Basis unplausibel, fehlt: "+required)
+
+          original_body=body
+          for extra in ("warehouses","transportLocations"):
+              if re.search(r"['\"]"+re.escape(extra)+r"['\"]", body) is None:
+                  body += ",'"+extra+"'"
+
+          if body==original_body:
+              raise SystemExit("034B: warehouses/transportLocations waren unerwartet bereits vollständig in sectionKeys.")
+
+          store_src=store_src[:m.start("body")] + body + store_src[m.end("body"):]
+          store_path.write_text(store_src,encoding="utf-8",newline="\n")
+          print("034B: SPStore sectionKeys erweitert:",store_path)
+
+          # 3) Laufzeit-Patch: bestehende Ensure-Funktionen verwenden,
+          #    Stammdaten vor JEDEM persist() normalisieren und Meta-Müll entfernen.
+          patch=r"""
+          /* DP_DLB_034B_1_16_0_15_DP_DATA_STAMMDATEN_PERSISTENZ_BEGIN */
+          (function(){
+            if(window.__DISPOLUX_034B?.version==='1.16.0.15')return;
+
+            function dp34BText(v){return String(v??'').trim();}
+
+            function dp34BMetaImportant(m){
+              if(!m||typeof m!=='object')return false;
+              if(m.isWasteFacility===true||m.isEfb===true)return true;
+              if(dp34BText(m.certificateValidUntil)||dp34BText(m.note))return true;
+              if(Array.isArray(m.acceptedAvv)&&m.acceptedAvv.some(x=>dp34BText(x)))return true;
+              const typ=dp34BText(m.locationType);
+              return !!typ && typ!=='Lade-/Abladestelle';
+            }
+
+            function dp34BPrepareMasterData(){
+              if(!state||typeof state!=='object')return {metaBefore:0,metaAfter:0};
+
+              try{
+                if(typeof dpR1EnsureState==='function')dpR1EnsureState();
+              }catch(e){console.warn('DLB-034B Transportorte vorbereiten',e);}
+
+              try{
+                if(typeof dpWLEnsureState==='function')dpWLEnsureState();
+              }catch(e){console.warn('DLB-034B Lager vorbereiten',e);}
+
+              if(!Array.isArray(state.transportLocations))state.transportLocations=[];
+              if(!Array.isArray(state.warehouses))state.warehouses=[];
+
+              // Falls historische Vorgänge einen benannten Lagerplatz referenzieren,
+              // diesen beim ersten stabilen Speichern nicht verlieren.
+              const knownWarehouseIds=new Set(
+                state.warehouses.map(w=>dp34BText(w?.id)).filter(Boolean)
+              );
+              const absorbWarehouse=(x)=>{
+                const id=dp34BText(x?.warehouseId);
+                const name=dp34BText(x?.warehouseName);
+                if(!id||!name||knownWarehouseIds.has(id))return;
+                state.warehouses.push({id,name,active:true});
+                knownWarehouseIds.add(id);
+              };
+              (state.bins||[]).forEach(absorbWarehouse);
+              (state.orders||[]).forEach(absorbWarehouse);
+              (state.archiveOrders||[]).forEach(absorbWarehouse);
+
+              state.settings=state.settings||{};
+              const meta=Array.isArray(state.settings.transportLocationMeta)
+                ? state.settings.transportLocationMeta
+                : [];
+
+              const liveIds=new Set(
+                state.transportLocations
+                  .map(x=>dp34BText(x?.id))
+                  .filter(Boolean)
+              );
+
+              const seen=new Set();
+              const compact=[];
+              meta.forEach(raw=>{
+                if(!raw||typeof raw!=='object')return;
+                const id=dp34BText(raw.id);
+                if(!id||seen.has(id))return;
+
+                // Aktuell referenzierte Metadaten bleiben.
+                // Nicht mehr referenzierte Einträge bleiben NUR,
+                // wenn fachliche Information hinterlegt ist.
+                if(!liveIds.has(id)&&!dp34BMetaImportant(raw))return;
+
+                seen.add(id);
+                compact.push(raw);
+              });
+
+              state.settings.transportLocationMeta=compact;
+              return {metaBefore:meta.length,metaAfter:compact.length};
+            }
+
+            const dp34BBasePersist=(typeof persist==='function')?persist:null;
+            if(dp34BBasePersist){
+              persist=async function(){
+                const c=dp34BPrepareMasterData();
+                if(c.metaBefore!==c.metaAfter){
+                  console.info(
+                    'DLB-034B transportLocationMeta verdichtet:',
+                    c.metaBefore,'->',c.metaAfter
+                  );
+                }
+                return await dp34BBasePersist.apply(this,arguments);
+              };
+            }
+
+            window.__DISPOLUX_034B={
+              version:'1.16.0.15',
+              prepareMasterData:dp34BPrepareMasterData
+            };
+          })();
+          /* DP_DLB_034B_1_16_0_15_DP_DATA_STAMMDATEN_PERSISTENZ_END */
+          """
+
+          src=src.replace(end_marker,patch+"\n\n"+end_marker,1)
+          runtime.write_text(src,encoding="utf-8",newline="\n")
+          print("034B: Runtime-Patch eingefügt:",runtime)
+          PY_PATCH_034B
+
+      - name: Set 034B SPFx version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VER_034B'
+          from pathlib import Path
+          p=Path("spfx-build/config/package-solution.json")
+          src=p.read_text(encoding="utf-8")
+          if "1.3.6.108" not in src:
+              raise SystemExit("034B: erwartete 033C-SPFx-Version 1.3.6.108 fehlt.")
+          p.write_text(src.replace("1.3.6.108","1.3.6.109",1),encoding="utf-8",newline="\n")
+          PY_VER_034B
+
+      - name: Validate 034B source before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VALIDATE_034B'
+          from pathlib import Path
+          import json
+          import re
+          import subprocess
+
+          root=Path("spfx-build/src/webparts")
+          files=[p for p in root.rglob("*") if p.is_file() and p.suffix in {".js",".ts",".tsx"}]
+          begin="DP_DLB_034B_1_16_0_15_DP_DATA_STAMMDATEN_PERSISTENZ_BEGIN"
+          end="DP_DLB_034B_1_16_0_15_DP_DATA_STAMMDATEN_PERSISTENZ_END"
+
+          hits=[]
+          all_text=[]
+          for p in files:
+              src=p.read_text(encoding="utf-8")
+              all_text.append(src)
+              if begin in src:
+                  hits.append((p,src))
+
+          if len(hits)!=1:
+              raise SystemExit(f"034B VALIDIERUNG: Patch in {len(hits)} Dateien statt genau 1 gefunden.")
+
+          runtime,src=hits[0]
+          if end not in src:
+              raise SystemExit("034B VALIDIERUNG: Endmarker fehlt.")
+
+          combined="\n".join(all_text)
+
+          # Neue Persistenzfelder müssen im echten SPStore stehen.
+          section_matches=list(re.finditer(r"sectionKeys\s*:\s*\[([^\]]*)\]",combined))
+          if len(section_matches)!=1:
+              raise SystemExit(f"034B VALIDIERUNG: sectionKeys {len(section_matches)}x statt 1x.")
+          section_body=section_matches[0].group(1)
+          for key in ("warehouses","transportLocations"):
+              if re.search(r"['\"]"+re.escape(key)+r"['\"]",section_body) is None:
+                  raise SystemExit("034B VALIDIERUNG: neue DP_Data-Sektion fehlt: "+key)
+
+          required=[
+              "dp34BPrepareMasterData",
+              "dp34BMetaImportant",
+              "transportLocationMeta",
+              "__DISPOLUX_034B",
+              "version:'1.16.0.15'",
+              "DP_DLB_033C_1_16_0_14_STELLEN_MATERIAL_BEGIN",
+              "DP_DLB_031G_1_16_0_6_STANDORTE_NAVIGATION_BEGIN",
+              "dp32BDriverButton",
+              "Geplantes Material",
+          ]
+          missing=[x for x in required if x not in combined]
+          if missing:
+              raise SystemExit("034B VALIDIERUNG: Pflichtbestandteile fehlen: "+", ".join(missing))
+
+          # Bestehende, richtige Backup-Architektur muss unverändert erhalten bleiben:
+          # 030AE stoppt DPB-Schreiben, 030AH sichert als Dateien.
+          for marker in (
+              "DP_DLB_030AE_1_12_1_24_DPB_AUS_DP_DATA_ENTFERNT_BEGIN",
+              "DP_DLB_030AH_1_12_1_27_BACKUP_30MIN_FILES_BEGIN",
+              "DispoLux_Backup",
+          ):
+              if marker not in combined:
+                  raise SystemExit("034B VALIDIERUNG: Backup-Basis fehlt: "+marker)
+
+          if "await dp28dBackup(fields, rows, force);" in combined:
+              raise SystemExit("034B VALIDIERUNG: alter DPB-Schreibaufruf ist wieder aktiv.")
+
+          pkg=Path("spfx-build/config/package-solution.json")
+          data=json.loads(pkg.read_text(encoding="utf-8"))
+          version=data.get("solution",{}).get("version","")
+          if version!="1.3.6.109":
+              raise SystemExit(f"034B VALIDIERUNG: SPFx-Version {version!r} statt 1.3.6.109")
+
+          if runtime.suffix==".js":
+              subprocess.run(["node","--check",str(runtime)],check=True)
+
+          print("034B VALIDIERUNG OK")
+          print("- SPStore speichert warehouses + transportLocations")
+          print("- transportLocationMeta wird vor persist() verdichtet")
+          print("- 030AE DPB-Stop bleibt aktiv")
+          print("- 030AH 30-Minuten-Dateibackup bleibt aktiv")
+          PY_VALIDATE_034B
+
+      - name: Build and package 034B
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd spfx-build && npx heft build --production)
+          (cd spfx-build && npx heft package-solution --production)
+
+          rm -rf artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n1)
+          test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          if [ -d spfx-build/release/assets ]; then
+            cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d spfx-build/temp/deploy ]; then
+            cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else
+            echo "034B: Keine SPFx Asset-Ausgabe gefunden." >&2
+            exit 1
+          fi
+
+          if [ -f .dpx14_icon_b64 ]; then
+            python3 - <<'PY_ICON_034B'
+          from pathlib import Path
+          import base64
+          Path("artifact/UPLOAD_TO_SITEASSETS/DispoLux_DL_Icon_48.png").write_bytes(
+              base64.b64decode(Path(".dpx14_icon_b64").read_text().strip())
+          )
+          PY_ICON_034B
+          fi
+
+      - name: Validate emitted 034B package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COUNT=0
+          while IFS= read -r -d '' JS; do
+            test -s "$JS"
+            node --check "$JS"
+            COUNT=$((COUNT+1))
+          done < <(find artifact/UPLOAD_TO_SITEASSETS -maxdepth 1 -type f -name '*.js' -print0)
+          test "$COUNT" -gt 0
+
+          PKG=artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+          test -s "$PKG"
+
+          grep -R -Fq '__DISPOLUX_034B' artifact/UPLOAD_TO_SITEASSETS
+          grep -R -Fq 'transportLocations' artifact/UPLOAD_TO_SITEASSETS
+          grep -R -Fq 'warehouses' artifact/UPLOAD_TO_SITEASSETS
+          grep -R -Fq 'DispoLux_Backup' artifact/UPLOAD_TO_SITEASSETS
+          grep -R -Fq 'Geplantes Material' artifact/UPLOAD_TO_SITEASSETS
+          grep -R -Fq 'Standort setzen' artifact/UPLOAD_TO_SITEASSETS
+          grep -R -Fq 'dp32BDriverButton' artifact/UPLOAD_TO_SITEASSETS
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DLB-034B-1.16.0.15 · DP DATA / STAMMDATEN-PERSISTENZ · SPFx 1.3.6.109
+
+          Basis:
+          - erfolgreicher DLB-033C-1.16.0.14
+          - Standort/Navigation aus 031G enthalten
+          - stabile Fahrerauswahl aus 032E enthalten
+          - Stellen / geplantes Material aus 033C enthalten
+          - 030AE DPB-Stop unverändert aktiv
+          - 030AH Dateisicherung alle 30 Minuten unverändert aktiv
+
+          Reparatur:
+          - warehouses wird als eigene DP_Data-Sektion dauerhaft gespeichert.
+          - transportLocations wird als eigene DP_Data-Sektion dauerhaft gespeichert.
+          - Lagerplätze verschwinden nach Neu laden / Autosync nicht mehr wegen fehlender Persistenz.
+          - Transportort-IDs bleiben nach dem ersten Speichern stabil.
+          - transportLocationMeta wird vor dem Speichern verdichtet:
+            aktuelle Einträge bleiben erhalten;
+            fachlich befüllte Alt-Metadaten bleiben erhalten;
+            leere verwaiste Meta-Einträge werden entfernt.
+          - Historisch benannte Lagerreferenzen werden vor dem ersten Speichern übernommen.
+          - Keine bestehenden DPB-Zeilen werden automatisch gelöscht.
+          - Keine Aufträge, Kunden, Baustellen, Mulden oder Mitteilungen werden automatisch gelöscht.
+
+          Nach Installation testen:
+          1. DispoLux vollständig neu öffnen.
+          2. Neuen Lagerplatz anlegen.
+          3. Auto-Sync/Speichern abwarten.
+          4. Browser neu laden.
+          5. Lagerplatz muss weiterhin vorhanden sein.
+          6. Zweiten Browser öffnen; Lagerplatz muss dort ebenfalls vorhanden sein.
+          7. DP_Data kontrollieren: DP|warehouses und DP|transportLocations müssen existieren.
+          8. DP|settings muss nach einem Speichervorgang deutlich kleiner werden.
+          TXT
+
+          echo "034B: Produktions-JS syntaktisch gültig; SPPKG vorhanden; Stammdaten-Persistenz und bestehende Backup-Architektur geprüft."
+
+      - name: Upload DLB-034B artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-034B-1.16.0.15-DP-DATA-STAMMDATEN-PERSISTENZ-SPFX-1.3.6.109
+          path: artifact/
+          if-no-files-found: error
