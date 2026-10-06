@@ -1,0 +1,761 @@
+name: DLB-036A-1.16.0.17 OFFLINE RETRY SAFETY FULL BUILD
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/DLB-036A-1.16.0.17_OFFLINE_RETRY_SAFETY_FULL_BUILD.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Rebuild exact successful DLB-035B basis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY_RUN_035B_BASE'
+          from pathlib import Path
+          import subprocess
+          import yaml
+
+          wf=Path('.github/workflows/DLB-035B-1.16.0.16_AUFTRAG_KONTAKT_MEHRMULDEN_MATERIAL_FULL_BUILD.yml')
+          if not wf.exists():
+              raise SystemExit('036A: erfolgreicher 035B-Workflow fehlt im Repository.')
+
+          doc=yaml.safe_load(wf.read_text(encoding='utf-8'))
+          runs=[(s.get('name',''),s.get('run')) for s in doc['jobs']['build']['steps'] if s.get('run')]
+          if len(runs)!=6:
+              raise SystemExit(f'036A: 035B-Basis erwartet 6 ausführbare Buildschritte, gefunden {len(runs)}.')
+
+          for idx,(name,script) in enumerate(runs,1):
+              print(f'===== 036A Basis 035B Schritt {idx}/{len(runs)}: {name} =====')
+              runner=Path(f'.036a_035b_step_{idx}.sh')
+              runner.write_text(script,encoding='utf-8',newline='\n')
+              try:
+                  subprocess.run(['bash','-euo','pipefail',str(runner)],check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+
+          print('036A: erfolgreicher DLB-035B-Stand vollständig rekonstruiert.')
+          PY_RUN_035B_BASE
+
+      - name: Apply DLB-036A offline and retry safety
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH_036A'
+          from pathlib import Path
+          import subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+
+          base_marker='DP_DLB_035B_1_16_0_16_AUFTRAG_KONTAKT_MEHRMULDEN_MATERIAL_BEGIN'
+          new_marker='DP_DLB_036A_1_16_0_17_OFFLINE_RETRY_SAFETY_BEGIN'
+          end_marker='/* DP13_PATCH_END */'
+
+          required_existing=[
+              base_marker,
+              'DP_DLB_034D_1_16_0_15_DP_DATA_STAMMDATEN_PERSISTENZ_BEGIN',
+              'plannedBinMaterials',
+              'actualBinMaterials',
+              'actualExistingBinMaterials',
+              'Telefon Baustelle',
+              'Geplanter Inhalt je gestellter Mulde',
+              'DP_DLB_030I_1_12_1_2_MULTIUSER_SYNC_CACHE_BEGIN',
+              'DP_DLB_030I_1_12_1_2_AUTOSYNC_MERGE_GUARD_BEGIN',
+              'DP_DLB_030J_1_12_1_3_ORDERS_DIREKT_SYNC_BEGIN',
+              'DP_DLB_030AH_1_12_1_27_BACKUP_30MIN_FILES_BEGIN',
+              'async function loadState',
+              'async function dpG3Poll',
+          ]
+
+          candidates=[]
+          for p in files:
+              src=p.read_text(encoding='utf-8')
+              if end_marker in src and all(x in src for x in required_existing):
+                  candidates.append((p,src))
+
+          if len(candidates)!=1:
+              raise SystemExit(
+                  '036A: erwartete genau eine vollständige 035B-App-Runtime, gefunden: '
+                  +repr([str(p) for p,_ in candidates])
+              )
+
+          runtime,src=candidates[0]
+          if new_marker in src:
+              raise SystemExit('036A: Patch bereits vorhanden.')
+          if src.count(end_marker)!=1:
+              raise SystemExit(f'036A: DP13-Endmarker {src.count(end_marker)}x statt 1x.')
+          if src.count(base_marker)!=1:
+              raise SystemExit(f'036A: 035B-Basismarker {src.count(base_marker)}x statt 1x.')
+
+          patch=r"""
+          /* DP_DLB_036A_1_16_0_17_OFFLINE_RETRY_SAFETY_BEGIN */
+          (function(){
+            'use strict';
+            if(window.__DISPOLUX_036A?.version==='1.16.0.17')return;
+
+            const dp36CacheKey='DispoLux:036A:lastGoodState:v1';
+            const dp36NoticeWindowMs=60000;
+            const dp36BasePersist=(typeof persist==='function')?persist:null;
+            const dp36BaseLoadState=(typeof loadState==='function')?loadState:null;
+            const dp36BasePoll=(typeof dpG3Poll==='function')?dpG3Poll:null;
+
+            let dp36PersistRunning=null;
+            let dp36RequestedHash='';
+            let dp36LastSuccessHash='';
+            let dp36WriteBlocked=false;
+            let dp36OfflineReadOnly=false;
+            let dp36Recovering=false;
+            let dp36RecoveryRead=false;
+            let dp36RecoverTimer=null;
+            let dp36KnownNoticeIds=new Set();
+
+            function dp36Text(v){return String(v??'').trim();}
+            function dp36Online(){return typeof navigator==='undefined'||navigator.onLine!==false;}
+            function dp36Now(){return new Date().toISOString();}
+            function dp36StateJson(){try{return JSON.stringify(state??{});}catch(_){return '';}}
+            function dp36Hash(value){
+              const s=String(value||'');
+              let h=2166136261;
+              for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}
+              return (h>>>0).toString(16)+':'+s.length;
+            }
+            function dp36Status(msg){
+              try{if(typeof dpG3Status==='function'){dpG3Status(msg);return;}}catch(_){}
+              try{const el=document.getElementById('storageStatus');if(el)el.textContent=msg;}catch(_){}
+            }
+            function dp36Banner(message,bad=false){
+              try{
+                let el=document.getElementById('dp36ConnectivityBanner');
+                if(!message){if(el)el.style.display='none';return;}
+                if(!el){
+                  el=document.createElement('div');
+                  el.id='dp36ConnectivityBanner';
+                  el.setAttribute('role','status');
+                  el.style.position='sticky';
+                  el.style.top='0';
+                  el.style.zIndex='99999';
+                  el.style.padding='10px 14px';
+                  el.style.fontWeight='700';
+                  el.style.textAlign='center';
+                  el.style.borderBottom='1px solid rgba(0,0,0,.18)';
+                  const host=document.body||document.documentElement;
+                  host.insertBefore(el,host.firstChild||null);
+                }
+                el.style.display='block';
+                el.style.background=bad?'#ffd8d8':'#fff0b8';
+                el.style.color='#202020';
+                el.textContent=message;
+              }catch(_){}
+            }
+            function dp36Networkish(e){
+              const status=Number(e&&((e.status!==undefined)?e.status:e.statusCode)||0);
+              if(!dp36Online())return true;
+              if([0,408,425,429,500,502,503,504].includes(status))return true;
+              const q=dp36Text(e&&e.message||e).toLowerCase();
+              return /network|failed to fetch|load failed|timeout|timed out|connection|offline|netz|verbindung|gateway|service unavailable/.test(q);
+            }
+            function dp36CloneState(){try{return JSON.parse(JSON.stringify(state??{}));}catch(_){return null;}}
+            function dp36CacheState(reason){
+              if(!dp36Online())return false;
+              const snap=dp36CloneState();
+              if(!snap)return false;
+              try{
+                localStorage.setItem(dp36CacheKey,JSON.stringify({
+                  version:1,
+                  savedAt:dp36Now(),
+                  reason:dp36Text(reason),
+                  state:snap
+                }));
+                return true;
+              }catch(e){
+                console.warn('DLB-036A: letzter sicherer Stand konnte lokal nicht gespeichert werden',e);
+                return false;
+              }
+            }
+            function dp36ReadCache(){
+              try{
+                const raw=localStorage.getItem(dp36CacheKey);
+                if(!raw)return null;
+                const parsed=JSON.parse(raw);
+                return parsed&&parsed.state?parsed:null;
+              }catch(e){
+                console.warn('DLB-036A: lokaler sicherer Stand konnte nicht gelesen werden',e);
+                return null;
+              }
+            }
+            function dp36ApplyCachedState(markOffline=true){
+              const cached=dp36ReadCache();
+              if(!cached)return null;
+              try{
+                const restored=(typeof migrateState==='function')?migrateState(cached.state):cached.state;
+                if(!restored)return null;
+                state=restored;
+                try{if(typeof sessionUser!=='undefined'&&sessionUser)state.user=sessionUser;}catch(_){}
+                if(markOffline){dp36OfflineReadOnly=true;dp36WriteBlocked=true;}
+                return cached;
+              }catch(e){
+                console.error('DLB-036A: lokaler sicherer Stand konnte nicht wiederhergestellt werden',e);
+                return null;
+              }
+            }
+            function dp36Render(){
+              try{
+                if(typeof renderAll==='function')renderAll();
+                else if(typeof dpG3RenderVisibleScreen==='function')dpG3RenderVisibleScreen();
+              }catch(e){console.warn('DLB-036A Render',e);}
+            }
+            function dp36RefreshKnownNotices(){
+              const arr=(state&&Array.isArray(state.dispoNotices))?state.dispoNotices:[];
+              dp36KnownNoticeIds=new Set(arr.filter(n=>n&&n.id!=null).map(n=>String(n.id)));
+            }
+            function dp36NoticeKey(n){
+              if(!n)return '';
+              return [
+                dp36Text(n.driver),
+                dp36Text(n.orderId),
+                dp36Text(n.kind),
+                dp36Text(n.message).replace(/\s+/g,' ')
+              ].join('|').toLowerCase();
+            }
+            function dp36NoticeStamp(n){
+              const v=Date.parse(dp36Text(n&&n.createdAt));
+              return Number.isFinite(v)?v:0;
+            }
+            function dp36DedupeNewNotices(){
+              const arr=(state&&Array.isArray(state.dispoNotices))?state.dispoNotices:null;
+              if(!arr||!arr.length)return 0;
+              const drop=new Set();
+              for(let i=0;i<arr.length;i++){
+                const n=arr[i];
+                if(!n||n.id==null||dp36KnownNoticeIds.has(String(n.id)))continue;
+                const key=dp36NoticeKey(n);
+                const stamp=dp36NoticeStamp(n);
+                if(!key||!stamp)continue;
+                for(let j=0;j<i;j++){
+                  const prev=arr[j];
+                  if(!prev||drop.has(j)||dp36NoticeKey(prev)!==key)continue;
+                  const ps=dp36NoticeStamp(prev);
+                  if(ps&&ps<=stamp&&(stamp-ps)<=dp36NoticeWindowMs){drop.add(i);break;}
+                }
+              }
+              if(!drop.size)return 0;
+              state.dispoNotices=arr.filter((_,idx)=>!drop.has(idx));
+              console.warn('DLB-036A: doppelte neue Dispo-Mitteilungen unterdrückt:',drop.size);
+              return drop.size;
+            }
+            function dp36OfflineError(message,code){
+              const e=new Error(message);
+              try{e.code=code;}catch(_){}
+              return e;
+            }
+            function dp36ShowOfflineCache(reason){
+              const cached=dp36ApplyCachedState(true);
+              if(cached){
+                const when=dp36Text(cached.savedAt)||'unbekannt';
+                dp36RefreshKnownNotices();
+                dp36Banner('OFFLINE / Verbindung gestört – letzter sicherer Stand '+when+' – nur Ansicht, Speichern gesperrt.',true);
+                dp36Status('OFFLINE · letzter sicherer Stand '+when+' · nur Ansicht');
+                console.warn('DLB-036A: letzter sicherer Stand angezeigt:',reason,when);
+                return true;
+              }
+              dp36OfflineReadOnly=true;
+              dp36WriteBlocked=true;
+              dp36Banner('OFFLINE – kein lokaler sicherer Stand vorhanden. Verbindung erforderlich.',true);
+              dp36Status('OFFLINE · keine lokalen Daten verfügbar');
+              return false;
+            }
+
+            function dp36ScheduleRecover(delay=3000){
+              if(dp36RecoverTimer||!dp36Online())return;
+              dp36RecoverTimer=setTimeout(function(){
+                dp36RecoverTimer=null;
+                dp36Recover();
+              },Math.max(250,Number(delay)||3000));
+            }
+
+            async function dp36Recover(){
+              if(dp36Recovering||!dp36BaseLoadState||!dp36Online())return false;
+              if(!dp36WriteBlocked&&!dp36OfflineReadOnly)return true;
+              dp36Recovering=true;
+              if(dp36RecoverTimer){clearTimeout(dp36RecoverTimer);dp36RecoverTimer=null;}
+              dp36Banner('Verbindung wieder da – Serverstand wird neu geladen. Speichern bleibt noch gesperrt.');
+              try{
+                const cached=dp36ApplyCachedState(false);
+                if(!cached){
+                  dp36Banner('Verbindung wieder da, aber kein sicherer Ausgangsstand vorhanden. DispoLux bitte neu laden.',true);
+                  return false;
+                }
+                dp36RecoveryRead=true;
+                await dp36BaseLoadState();
+                dp36RecoveryRead=false;
+                dp36LastSuccessHash=dp36Hash(dp36StateJson());
+                dp36RefreshKnownNotices();
+                dp36CacheState('recovery-server-reload');
+                dp36WriteBlocked=false;
+                dp36OfflineReadOnly=false;
+                dp36Render();
+                dp36Banner('');
+                dp36Status('✓ Verbindung wiederhergestellt · Serverstand neu geladen');
+                return true;
+              }catch(e){
+                dp36RecoveryRead=false;
+                dp36WriteBlocked=true;
+                dp36OfflineReadOnly=!dp36Online();
+                dp36Banner('Verbindung noch nicht stabil – Speichern bleibt gesperrt.',true);
+                console.warn('DLB-036A: Server-Reload noch nicht möglich',e);
+                dp36ScheduleRecover(15000);
+                return false;
+              }finally{
+                dp36Recovering=false;
+              }
+            }
+
+            if(dp36BasePersist){
+              persist=async function(){
+                if(dp36RecoveryRead)return true;
+
+                dp36DedupeNewNotices();
+                let currentHash=dp36Hash(dp36StateJson());
+                dp36RequestedHash=currentHash;
+
+                if(!dp36Online()){
+                  dp36ShowOfflineCache('Speichern ohne Verbindung');
+                  dp36Render();
+                  throw dp36OfflineError('OFFLINE: Speichern wurde nicht ausgeführt.','DP36_OFFLINE');
+                }
+
+                if(dp36WriteBlocked){
+                  dp36Banner('Speichern gesperrt – zuerst wird der aktuelle Serverstand neu geladen.',true);
+                  dp36ScheduleRecover(500);
+                  throw dp36OfflineError('Speichern gesperrt, bis der Serverstand neu geladen wurde.','DP36_RELOAD_REQUIRED');
+                }
+
+                if(dp36LastSuccessHash&&currentHash===dp36LastSuccessHash)return true;
+                if(dp36PersistRunning)return dp36PersistRunning;
+
+                const self=this;
+                const args=arguments;
+                dp36PersistRunning=(async function(){
+                  let result=true;
+                  for(let round=0;round<4;round++){
+                    dp36DedupeNewNotices();
+                    const runHash=dp36Hash(dp36StateJson());
+                    dp36RequestedHash=runHash;
+                    if(dp36LastSuccessHash&&runHash===dp36LastSuccessHash)break;
+                    try{
+                      result=await dp36BasePersist.apply(self,args);
+                      dp36LastSuccessHash=runHash;
+                      dp36RefreshKnownNotices();
+                      dp36CacheState('persist-confirmed');
+                    }catch(e){
+                      if(dp36Networkish(e)){
+                        dp36WriteBlocked=true;
+                        dp36OfflineReadOnly=!dp36Online();
+                        dp36Banner('Speichern nicht sicher bestätigt – KEIN automatischer Schreib-Retry. Vor dem nächsten Speichern wird der Serverstand neu geladen.',true);
+                        dp36Status('⚠ Speichern nicht sicher bestätigt · Schreib-Retry gesperrt');
+                        dp36ScheduleRecover(3000);
+                      }
+                      throw e;
+                    }
+                    if(dp36WriteBlocked||!dp36Online())break;
+                    const afterHash=dp36Hash(dp36StateJson());
+                    if(afterHash===runHash)break;
+                    dp36RequestedHash=afterHash;
+                  }
+                  return result;
+                })().finally(function(){dp36PersistRunning=null;});
+
+                return dp36PersistRunning;
+              };
+            }
+
+            if(dp36BaseLoadState){
+              loadState=async function(){
+                if(!dp36Online()){
+                  if(dp36ShowOfflineCache('Start ohne Netz'))return;
+                  throw dp36OfflineError('OFFLINE: Kein lokaler letzter Datenstand vorhanden.','DP36_NO_CACHE');
+                }
+                try{
+                  const r=await dp36BaseLoadState.apply(this,arguments);
+                  dp36OfflineReadOnly=false;
+                  dp36WriteBlocked=false;
+                  dp36LastSuccessHash=dp36Hash(dp36StateJson());
+                  dp36RefreshKnownNotices();
+                  dp36CacheState('load-confirmed');
+                  dp36Banner('');
+                  return r;
+                }catch(e){
+                  if(dp36Networkish(e)&&dp36ShowOfflineCache('Laden fehlgeschlagen'))return;
+                  throw e;
+                }
+              };
+            }
+
+            if(dp36BasePoll){
+              dpG3Poll=async function(){
+                if(!dp36Online()){
+                  dp36OfflineReadOnly=true;
+                  dp36WriteBlocked=true;
+                  dp36Banner('OFFLINE – letzter sicherer Stand bleibt sichtbar; Auto-Sync und Speichern sind gesperrt.',true);
+                  return;
+                }
+                if(dp36WriteBlocked||dp36OfflineReadOnly){
+                  dp36ScheduleRecover(500);
+                  return;
+                }
+                try{
+                  return await dp36BasePoll.apply(this,arguments);
+                }catch(e){
+                  if(dp36Networkish(e)){
+                    dp36WriteBlocked=true;
+                    dp36Banner('Auto-Sync wegen Verbindungsfehler gestoppt – vor weiteren Schreibvorgängen wird der Serverstand neu geladen.',true);
+                    dp36ScheduleRecover(3000);
+                  }
+                  throw e;
+                }
+              };
+            }
+
+            window.addEventListener('offline',function(){
+              dp36OfflineReadOnly=true;
+              dp36WriteBlocked=true;
+              dp36Banner('OFFLINE – letzter sicherer Stand bleibt sichtbar; Speichern und Auto-Sync sind gesperrt.',true);
+              dp36Status('OFFLINE · nur Ansicht · Speichern gesperrt');
+            });
+            window.addEventListener('online',function(){dp36ScheduleRecover(500);});
+
+            try{dp36RefreshKnownNotices();}catch(_){}
+            if(!dp36Online()){
+              dp36OfflineReadOnly=true;
+              dp36WriteBlocked=true;
+              dp36Banner('OFFLINE – letzter sicherer Stand wird verwendet; Speichern gesperrt.',true);
+            }
+
+            window.__DISPOLUX_036A={
+              version:'1.16.0.17',
+              recover:dp36Recover,
+              isWriteBlocked:function(){return dp36WriteBlocked;},
+              isOfflineReadOnly:function(){return dp36OfflineReadOnly;},
+              cacheKey:dp36CacheKey
+            };
+          })();
+          /* DP_DLB_036A_1_16_0_17_OFFLINE_RETRY_SAFETY_END */
+          """
+
+          src=src.replace(end_marker,patch+'\n\n'+end_marker,1)
+          runtime.write_text(src,encoding='utf-8',newline='\n')
+
+          if runtime.suffix=='.js':
+              subprocess.run(['node','--check',str(runtime)],check=True)
+
+          print('036A: Offline-/Retry-Schutz in geprüfte 035B-Runtime eingefügt:',runtime)
+          PY_PATCH_036A
+
+      - name: Set 036A SPFx version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VER_036A'
+          from pathlib import Path
+          p=Path('spfx-build/config/package-solution.json')
+          src=p.read_text(encoding='utf-8')
+          if src.count('1.3.6.110')!=1:
+              raise SystemExit(
+                  f"036A: erwartete 035B-SPFx-Version 1.3.6.110 genau einmal, gefunden {src.count('1.3.6.110')}x."
+              )
+          p.write_text(src.replace('1.3.6.110','1.3.6.111',1),encoding='utf-8',newline='\n')
+          PY_VER_036A
+
+      - name: Validate 036A source before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VALIDATE_036A'
+          from pathlib import Path
+          import json
+          import re
+          import subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          begin='DP_DLB_036A_1_16_0_17_OFFLINE_RETRY_SAFETY_BEGIN'
+          end='DP_DLB_036A_1_16_0_17_OFFLINE_RETRY_SAFETY_END'
+
+          hits=[]
+          all_text=[]
+          for p in files:
+              src=p.read_text(encoding='utf-8')
+              all_text.append(src)
+              if begin in src:hits.append((p,src))
+
+          if len(hits)!=1:
+              raise SystemExit(f'036A VALIDIERUNG: Patch in {len(hits)} Dateien statt genau 1 gefunden.')
+
+          runtime,src=hits[0]
+          if src.count(begin)!=1 or src.count(end)!=1:
+              raise SystemExit('036A VALIDIERUNG: Patchmarker nicht eindeutig.')
+          frag=src.split(begin,1)[1].split(end,1)[0]
+          combined='\n'.join(all_text)
+
+          required=[
+              'DispoLux:036A:lastGoodState:v1',
+              'dp36BasePersist',
+              'dp36BaseLoadState',
+              'dp36BasePoll',
+              'dp36DedupeNewNotices',
+              'dp36NoticeWindowMs=60000',
+              'KEIN automatischer Schreib-Retry',
+              "window.addEventListener('offline'",
+              "window.addEventListener('online'",
+              'dp36ScheduleRecover',
+              'dp36ApplyCachedState',
+              'persist-confirmed',
+              'recovery-server-reload',
+              'nur Ansicht',
+              'Speichern gesperrt',
+              "version:'1.16.0.17'",
+          ]
+          missing=[x for x in required if x not in frag]
+          if missing:
+              raise SystemExit('036A VALIDIERUNG: Pflichtbestandteile fehlen: '+', '.join(missing))
+
+          basis_required=[
+              'DP_DLB_035B_1_16_0_16_AUFTRAG_KONTAKT_MEHRMULDEN_MATERIAL_BEGIN',
+              'DP_DLB_034D_1_16_0_15_DP_DATA_STAMMDATEN_PERSISTENZ_BEGIN',
+              'DP_DLB_030I_1_12_1_2_MULTIUSER_SYNC_CACHE_BEGIN',
+              'DP_DLB_030I_1_12_1_2_AUTOSYNC_MERGE_GUARD_BEGIN',
+              'DP_DLB_030J_1_12_1_3_ORDERS_DIREKT_SYNC_BEGIN',
+              'DP_DLB_030AE_1_12_1_24_DPB_AUS_DP_DATA_ENTFERNT_BEGIN',
+              'DP_DLB_030AH_1_12_1_27_BACKUP_30MIN_FILES_BEGIN',
+              'DispoLux_Backup',
+              'plannedBinMaterials',
+              'actualBinMaterials',
+              'actualExistingBinMaterials',
+              'Telefon Baustelle',
+              'Telefon Kunde',
+              'Geplanter Inhalt je gestellter Mulde',
+              'Tatsächlicher Inhalt',
+          ]
+          missing=[x for x in basis_required if x not in combined]
+          if missing:
+              raise SystemExit('036A VALIDIERUNG: 035B-Basis unvollständig: '+', '.join(missing))
+
+          sections=list(re.finditer(r"sectionKeys\s*:\s*\[([^\]]*)\]",src))
+          if not sections:
+              raise SystemExit('036A VALIDIERUNG: keine sectionKeys gefunden.')
+          for idx,sm in enumerate(sections,1):
+              keys=set(re.findall(r"['\"]([^'\"]+)['\"]",sm.group(1)))
+              miss=[k for k in ('warehouses','transportLocations') if k not in keys]
+              if miss:
+                  raise SystemExit(f'036A VALIDIERUNG: sectionKeys #{idx} unvollständig: {miss}')
+
+          if 'await dp28dBackup(fields, rows, force);' in combined:
+              raise SystemExit('036A VALIDIERUNG: alter DPB-Schreibaufruf ist wieder aktiv.')
+
+          pkg=Path('spfx-build/config/package-solution.json')
+          data=json.loads(pkg.read_text(encoding='utf-8'))
+          version=data.get('solution',{}).get('version','')
+          if version!='1.3.6.111':
+              raise SystemExit(f'036A VALIDIERUNG: SPFx-Version {version!r} statt 1.3.6.111')
+
+          if runtime.suffix=='.js':
+              subprocess.run(['node','--check',str(runtime)],check=True)
+
+          print('036A VALIDIERUNG OK')
+          print('- Basis exakt DLB-035B')
+          print('- Offline-Datenstand nur lesend')
+          print('- kein blinder Schreib-Retry')
+          print('- Server-Reload vor erneuter Schreibfreigabe')
+          print('- persist-Aufrufe serialisiert')
+          print('- neue identische Dispo-Mitteilungen innerhalb 60 s dedupliziert')
+          PY_VALIDATE_036A
+
+      - name: Build and package 036A
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf spfx-build/release spfx-build/temp/deploy spfx-build/sharepoint/solution
+
+          (cd spfx-build && npx heft build --production)
+          (cd spfx-build && npx heft package-solution --production)
+
+          rm -rf artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n1)
+          test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          if [ -d spfx-build/release/assets ]; then
+            cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d spfx-build/temp/deploy ]; then
+            cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else
+            echo '036A: Keine SPFx Asset-Ausgabe gefunden.' >&2
+            exit 1
+          fi
+
+          if [ -f .dpx14_icon_b64 ]; then
+            python3 - <<'PY_ICON_036A'
+          from pathlib import Path
+          import base64
+          Path('artifact/UPLOAD_TO_SITEASSETS/DispoLux_DL_Icon_48.png').write_bytes(
+              base64.b64decode(Path('.dpx14_icon_b64').read_text().strip())
+          )
+          PY_ICON_036A
+          fi
+
+      - name: Validate emitted 036A package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COUNT=0
+          while IFS= read -r -d '' JS; do
+            test -s "$JS"
+            node --check "$JS"
+            COUNT=$((COUNT+1))
+          done < <(find artifact/UPLOAD_TO_SITEASSETS -maxdepth 1 -type f -name '*.js' -print0)
+          test "$COUNT" -gt 0
+
+          PKG=artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+          test -s "$PKG"
+
+          python3 - <<'PY_FINAL_036A'
+          from pathlib import Path
+          import re
+
+          assets=Path('artifact/UPLOAD_TO_SITEASSETS')
+          js_files=list(assets.glob('*.js'))
+          marker='__DISPOLUX_036A'
+          current=[]
+          for p in js_files:
+              s=p.read_text(encoding='utf-8')
+              if marker in s:current.append((p,s))
+
+          if len(current)!=1:
+              raise SystemExit(
+                  '036A FINAL: erwartet genau einen aktuellen Produktionsbundle mit '
+                  f'{marker}; gefunden {len(current)}: {[p.name for p,_ in current]}'
+              )
+
+          current_path,current_src=current[0]
+          required=[
+              '__DISPOLUX_034D',
+              '__DISPOLUX_035B',
+              '__DISPOLUX_036A',
+              'plannedBinMaterials',
+              'actualBinMaterials',
+              'actualExistingBinMaterials',
+              'Telefon Baustelle',
+              'Telefon Kunde',
+              'Geplanter Inhalt je gestellter Mulde',
+              'Tatsächlicher Inhalt',
+              'DispoLux:036A:lastGoodState:v1',
+              'OFFLINE',
+              'Speichern gesperrt',
+              'KEIN automatischer Schreib-Retry',
+              'warehouses',
+              'transportLocations',
+              'DispoLux_Backup',
+              'dp32BDriverButton',
+              'Standort setzen',
+          ]
+          missing=[x for x in required if x not in current_src]
+          if missing:
+              raise SystemExit('036A FINAL: Pflichtbestandteile fehlen im aktuellen Bundle: '+', '.join(missing))
+
+          sections=list(re.finditer(r"sectionKeys\s*:\s*\[([^\]]*)\]",current_src))
+          if not sections:
+              raise SystemExit('036A FINAL: keine sectionKeys im aktuellen Produktionsbundle gefunden.')
+          for idx,sm in enumerate(sections,1):
+              keys=set(re.findall(r"['\"]([^'\"]+)['\"]",sm.group(1)))
+              miss=[k for k in ('warehouses','transportLocations') if k not in keys]
+              if miss:
+                  raise SystemExit(f'036A FINAL: sectionKeys #{idx} unvollständig: {miss}')
+
+          stale=[]
+          for p in js_files:
+              if p==current_path:continue
+              s=p.read_text(encoding='utf-8')
+              if 'sectionKeys' in s and 'DP_Data' in s:stale.append(p.name)
+          if stale:
+              raise SystemExit('036A FINAL: alte DP_Data-WebPart-Bundles im Auslieferungsordner: '+repr(stale))
+
+          print('036A FINAL OK')
+          print('- aktueller Produktionsbundle:',current_path.name)
+          print('- 035B-Basis erhalten')
+          print('- Offline-/Retry-Schutz enthalten')
+          print('- keine alten DP_Data-WebPart-Bundles im Auslieferungsordner')
+          PY_FINAL_036A
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DLB-036A-1.16.0.17 · OFFLINE / SCHLECHTNETZ + SICHERES SCHREIB-/RETRY-VERHALTEN · SPFx 1.3.6.111
+
+          Verbindliche Basis:
+          - DLB-035B-1.16.0.16 / SPFx 1.3.6.110
+          - enthält vollständig die 034D-Stammdaten-Persistenz sowie die 035B-Auftrags-/Kontakt-/Mehrmulden-Materialfunktionen
+
+          Schutz in 036A:
+          - letzter erfolgreich geladener/gespeicherter Stand wird lokal als sicherer Lesestand gehalten
+          - Start mit bereits geladener App aber ohne Datenverbindung: letzter sicherer Stand kann angezeigt werden
+          - Offline ist bewusst nur lesend; Speichern und Auto-Sync sind gesperrt
+          - bei nicht sicher bestätigtem Speichern gibt es keinen blinden Schreib-Retry
+          - vor erneutem Speichern wird vom letzten sicheren Stand aus der Serverstand neu geladen
+          - erst nach erfolgreichem Server-Reload wird Schreiben wieder freigegeben
+          - parallele persist-Aufrufe werden serialisiert; identischer bestätigter Zustand wird nicht erneut geschrieben
+          - neue identische Dispo-Mitteilungen für Fahrer/Auftrag/Art/Text innerhalb 60 Sekunden werden vor dem Schreiben dedupliziert
+          - 035B vollständig erhalten: Kontakt/Navigation, Mehrmulden-Plan-/Ist-Material, 034D-Stammdaten-Persistenz, Orders-Direkt-Sync und 30-Minuten-Dateibackup
+
+          Wichtige Grenze:
+          - Wenn die SharePoint-/SPFx-App selbst ohne Netz überhaupt nicht aus dem Browsercache startet, kann 036A erst greifen, sobald das App-Shell geladen ist. Das ist getrennt von der Datensicherheit zu testen.
+
+          Pflicht-Praxistest nach Installation:
+          1. Mit gutem Netz starten und vollständig laden lassen.
+          2. DP_Data-Zähler notieren.
+          3. Netz trennen. Bereits geöffnete DispoLux-App muss Offline-Hinweis zeigen; vorhandener letzter sicherer Stand bleibt sichtbar.
+          4. Offline einen Speichervorgang versuchen: er muss blockiert werden; in DP_Data darf dadurch kein neuer Datensatz entstehen.
+          5. Netz wieder einschalten: zuerst Server-Reload, erst danach Schreibfreigabe.
+          6. Während eines Speichervorgangs Verbindung gezielt unterbrechen: kein automatischer zweiter Schreibversuch.
+          7. Nach Wiederverbindung prüfen, welcher Stand tatsächlich in SharePoint angekommen ist; danach bei Bedarf einmal bewusst erneut speichern.
+          8. Dieselbe Dispo-Änderung schnell doppelt auslösen: keine zweite identische neue Fahrer-Mitteilung innerhalb 60 Sekunden.
+          9. Lagerplatz aus 035B anlegen, neu laden und in zweitem Browser prüfen.
+          10. DP_Data-Zähler erneut prüfen: Netzfehler dürfen keine zusätzliche Datensatzflut erzeugen.
+          TXT
+
+          cat > artifact/DISPOLUX_THEMENREGISTER_ERGAENZUNG_036A.csv <<'CSV'
+          Bereich;Änderung;Build;Status
+          Offline / Schlechtnetz;Letzten sicheren Datenstand bei Datenverbindungsfehler anzeigen;DLB-036A;Umgesetzt
+          Offline / Schlechtnetz;Offline nur lesend Speichern und Auto-Sync gesperrt;DLB-036A;Umgesetzt
+          Datenintegrität;Kein blinder Schreib-Retry nach unsicherem Netzwerkfehler;DLB-036A;Umgesetzt
+          Datenintegrität;Server-Reload vom letzten sicheren Stand vor erneuter Schreibfreigabe;DLB-036A;Umgesetzt
+          Datenintegrität;persist-Aufrufe serialisiert und identischer bestätigter Zustand nicht erneut geschrieben;DLB-036A;Umgesetzt
+          Kommunikation;Neue identische Dispo-Mitteilungen innerhalb 60 Sekunden vor Speicherung dedupliziert;DLB-036A;Umgesetzt
+          CSV
+
+          echo '036A: Produktions-JS syntaktisch gültig; SPPKG vorhanden; Offline-/Retry-Schutz und 035B-Basis geprüft.'
+
+      - name: Upload DLB-036A artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-036A-1.16.0.17-OFFLINE-RETRY-SAFETY-SPFX-1.3.6.111
+          path: artifact/
+          if-no-files-found: error
