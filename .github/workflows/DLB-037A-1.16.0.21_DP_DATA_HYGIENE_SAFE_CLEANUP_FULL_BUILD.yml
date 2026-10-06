@@ -1,0 +1,546 @@
+name: DLB-037A-1.16.0.21 DP DATA HYGIENE SAFE CLEANUP FULL BUILD
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/DLB-037A-1.16.0.21_DP_DATA_HYGIENE_SAFE_CLEANUP_FULL_BUILD.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Rebuild exact tested DLB-036D basis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY_RUN_036D_BASE'
+          from pathlib import Path
+          import subprocess
+          import yaml
+
+          wf=Path('.github/workflows/DLB-036D-1.16.0.20_OFFLINE_OUTBOX_SYNC_FULL_BUILD.yml')
+          if not wf.exists():
+              raise SystemExit('037A: getesteter 036D-Workflow fehlt im Repository.')
+
+          doc=yaml.safe_load(wf.read_text(encoding='utf-8'))
+          runs=[(s.get('name',''),s.get('run')) for s in doc['jobs']['build']['steps'] if s.get('run')]
+          if len(runs)!=6:
+              raise SystemExit(f'037A: 036D-Basis erwartet 6 ausführbare Buildschritte, gefunden {len(runs)}.')
+
+          for idx,(name,script) in enumerate(runs,1):
+              print(f'===== 037A Basis 036D Schritt {idx}/{len(runs)}: {name} =====')
+              runner=Path(f'.037a_036d_step_{idx}.sh')
+              runner.write_text(script,encoding='utf-8',newline='\n')
+              try:
+                  subprocess.run(['bash','-euo','pipefail',str(runner)],check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+
+          print('037A: getesteter DLB-036D-Stand vollständig rekonstruiert.')
+          PY_RUN_036D_BASE
+
+      - name: Apply DLB-037A safe DP_Data housekeeping
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH_037A'
+          from pathlib import Path
+          import subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          base_marker='DP_DLB_036D_1_16_0_20_OFFLINE_OUTBOX_SYNC_BEGIN'
+          new_marker='DP_DLB_037A_1_16_0_21_DP_DATA_HYGIENE_BEGIN'
+          end_marker='/* DP13_PATCH_END */'
+
+          candidates=[]
+          for p in files:
+              src=p.read_text(encoding='utf-8')
+              if base_marker in src and end_marker in src:
+                  candidates.append((p,src))
+
+          if len(candidates)!=1:
+              raise SystemExit('037A: erwartete genau eine vollständige 036D-App-Runtime, gefunden: '+repr([str(p) for p,_ in candidates]))
+
+          runtime,src=candidates[0]
+          if new_marker in src:
+              raise SystemExit('037A: Patch bereits vorhanden.')
+          if src.count(end_marker)!=1:
+              raise SystemExit(f'037A: DP13-Endmarker {src.count(end_marker)}x statt 1x.')
+
+          patch=r"""
+          /* DP_DLB_037A_1_16_0_21_DP_DATA_HYGIENE_BEGIN */
+          (function(){
+            'use strict';
+            if(window.__DISPOLUX_037A?.version==='1.16.0.21')return;
+
+            const dp37aNoticeRetentionMs=72*60*60*1000;
+            const dp37aIntervalMs=30*60*1000;
+            const dp37aBaseLoadState=(typeof loadState==='function')?loadState:null;
+            let dp37aScheduleTimer=null;
+            let dp37aIntervalTimer=null;
+            let dp37aRunning=null;
+            let dp37aLastResult=null;
+
+            function dp37aText(v){return String(v??'').trim();}
+            function dp37aOnline(){return typeof navigator==='undefined'||navigator.onLine!==false;}
+            function dp37aNow(){return Date.now();}
+            function dp37aSleep(ms){return new Promise(r=>setTimeout(r,ms));}
+            function dp37aStatus(msg){
+              try{if(typeof dpG3Status==='function'){dpG3Status(msg);return;}}catch(_){}
+              try{const el=document.getElementById('storageStatus');if(el)el.textContent=msg;}catch(_){}
+            }
+            function dp37aBanner(message,bad=false){
+              try{
+                let el=document.getElementById('dp37aMaintenanceBanner');
+                if(!message){if(el)el.style.display='none';return;}
+                if(!el){
+                  el=document.createElement('div');
+                  el.id='dp37aMaintenanceBanner';
+                  el.setAttribute('role','status');
+                  el.style.position='sticky';
+                  el.style.top='0';
+                  el.style.zIndex='99998';
+                  el.style.padding='9px 12px';
+                  el.style.fontWeight='700';
+                  el.style.textAlign='center';
+                  el.style.borderBottom='1px solid rgba(0,0,0,.15)';
+                  (document.body||document.documentElement).insertBefore(el,(document.body||document.documentElement).firstChild||null);
+                }
+                el.style.display='block';
+                el.style.background=bad?'#ffd8d8':'#dff5e1';
+                el.style.color='#202020';
+                el.textContent=message;
+              }catch(_){}
+            }
+            function dp37aOutboxPending(){
+              try{return !!window.__DISPOLUX_036D?.hasPending?.();}catch(_){return false;}
+            }
+            function dp37aFinalStatus(v){
+              const x=dp37aText(v).toLocaleLowerCase('de-DE');
+              return ['ausgeführt','nicht ausgeführt','storniert','abgebrochen'].includes(x);
+            }
+            function dp37aNoticeExpired(n){
+              if(!n||(!n.acknowledgedAt&&!n.suppressedAt))return false;
+              const stamp=Date.parse(dp37aText(n.acknowledgedAt||n.suppressedAt||n.createdAt));
+              return Number.isFinite(stamp)&&stamp>0&&(dp37aNow()-stamp)>dp37aNoticeRetentionMs;
+            }
+            function dp37aArchiveKey(o){
+              if(!o||o.id==null)return '';
+              return [String(o.id),dp37aText(o.status),dp37aText(o.archivedAt)].join('|');
+            }
+            function dp37aPruneState(){
+              const result={noticeIds:[],orderIds:[]};
+              if(!state||typeof state!=='object')return result;
+
+              if(Array.isArray(state.dispoNotices)){
+                const keep=[];
+                for(const n of state.dispoNotices){
+                  if(dp37aNoticeExpired(n)){
+                    if(n&&n.id!=null)result.noticeIds.push(String(n.id));
+                  }else keep.push(n);
+                }
+                state.dispoNotices=keep;
+              }
+
+              const archive=Array.isArray(state.archiveOrders)?state.archiveOrders:[];
+              const exactArchive=new Set(
+                archive
+                  .filter(a=>a&&a.id!=null&&a.archivedAt&&dp37aFinalStatus(a.status))
+                  .map(dp37aArchiveKey)
+              );
+              if(Array.isArray(state.orders)){
+                const keep=[];
+                for(const o of state.orders){
+                  const safelyArchived=!!(
+                    o&&o.id!=null&&o.archivedAt&&dp37aFinalStatus(o.status)&&exactArchive.has(dp37aArchiveKey(o))
+                  );
+                  if(safelyArchived)result.orderIds.push(String(o.id));
+                  else keep.push(o);
+                }
+                state.orders=keep;
+              }
+              return result;
+            }
+            function dp37aRender(){
+              try{
+                if(typeof renderAll==='function')renderAll();
+                else if(typeof dpG3RenderVisibleScreen==='function')dpG3RenderVisibleScreen();
+              }catch(e){console.warn('DLB-037A Render',e);}
+            }
+            function dp37aSpReady(){
+              return typeof SPStore!=='undefined'&&SPStore&&
+                typeof SPStore.request==='function'&&typeof SPStore.listApi==='function'&&typeof SPStore.remove==='function';
+            }
+            async function dp37aQueryPrefix(prefix){
+              if(!dp37aSpReady())throw new Error('SPStore-Housekeeping-Schnittstelle nicht verfügbar.');
+              const filter=encodeURIComponent("startswith(Title,'"+String(prefix).replace(/'/g,"''")+"')");
+              let url=SPStore.listApi()+"/items?$select=Id,Title&$filter="+filter+"&$top=5000";
+              const rows=[];
+              const headers={'Accept':'application/json;odata=nometadata','Cache-Control':'no-cache, no-store, max-age=0','Pragma':'no-cache','Expires':'0'};
+              while(url){
+                const j=await SPStore.request(url,{headers,cache:'no-store'});
+                const part=Array.isArray(j&&j.value)?j.value:(Array.isArray(j&&j.d&&j.d.results)?j.d.results:[]);
+                for(const r of part)rows.push(r);
+                url=(j&&j['@odata.nextLink'])||(j&&j.d&&j.d.__next)||null;
+              }
+              return rows;
+            }
+            async function dp37aRemoveRow(row){
+              const id=Number(row&&((row.Id!==undefined)?row.Id:row.ID)||0);
+              const title=dp37aText(row&&row.Title);
+              if(!id||!title)return false;
+              try{
+                await SPStore.remove({id,title});
+              }catch(e){
+                const status=Number(e&&((e.status!==undefined)?e.status:e.statusCode)||0);
+                const msg=dp37aText(e&&e.message||e).toLowerCase();
+                if(status!==404&&!/not found|nicht gefunden/.test(msg))throw e;
+              }
+              try{if(SPStore.remote&&typeof SPStore.remote.delete==='function')SPStore.remote.delete(title);}catch(_){}
+              return true;
+            }
+            async function dp37aRemoveRows(rows,onProgress){
+              let removed=0;
+              const batchSize=5;
+              for(let i=0;i<rows.length;i+=batchSize){
+                if(!dp37aOnline())throw new Error('Verbindung während DP_Data-Bereinigung verloren.');
+                if(dp37aOutboxPending())throw new Error('Offline-Warteschlange während DP_Data-Bereinigung aktiv geworden.');
+                const part=rows.slice(i,i+batchSize);
+                const done=await Promise.all(part.map(dp37aRemoveRow));
+                removed+=done.filter(Boolean).length;
+                if(typeof onProgress==='function')onProgress(removed,rows.length);
+                if(i+batchSize<rows.length)await dp37aSleep(250);
+              }
+              return removed;
+            }
+            async function dp37aEnsureFreshBackup(){
+              if(typeof window.dpDispoLuxBackupStatus==='function'){
+                try{
+                  const s=window.dpDispoLuxBackupStatus();
+                  const when=Date.parse(dp37aText(s&&s.lastSuccess||s&&s.capturedAt));
+                  if(s&&s.ok===true&&Number.isFinite(when)&&(dp37aNow()-when)<35*60*1000)return true;
+                }catch(_){}
+              }
+              if(typeof window.dpDispoLuxBackupNow!=='function')return false;
+              await window.dpDispoLuxBackupNow();
+              if(typeof window.dpDispoLuxBackupStatus!=='function')return true;
+              const s=window.dpDispoLuxBackupStatus();
+              const when=Date.parse(dp37aText(s&&s.lastSuccess||s&&s.capturedAt));
+              return !!(s&&s.ok===true&&Number.isFinite(when)&&(dp37aNow()-when)<10*60*1000);
+            }
+            function dp37aSchedule(delay=1500){
+              if(dp37aScheduleTimer)return;
+              dp37aScheduleTimer=setTimeout(function(){
+                dp37aScheduleTimer=null;
+                dp37aHousekeeping().catch(e=>console.warn('DLB-037A Housekeeping',e));
+              },Math.max(250,Number(delay)||1500));
+            }
+            async function dp37aHousekeeping(){
+              if(dp37aRunning)return dp37aRunning;
+              if(!dp37aOnline()||dp37aOutboxPending())return false;
+              if(!dp37aSpReady()){
+                dp37aBanner('DP_Data-Bereinigung pausiert: technische SharePoint-Schnittstelle nicht verfügbar.',true);
+                return false;
+              }
+
+              dp37aRunning=(async function(){
+                dp37aStatus('DP_Data: sichere Bereinigung wird vorbereitet …');
+                const backupOk=await dp37aEnsureFreshBackup();
+                if(!backupOk){
+                  dp37aBanner('DP_Data wurde NICHT bereinigt: vorherige Dateisicherung konnte nicht bestätigt werden.',true);
+                  dp37aStatus('⚠ DP_Data-Bereinigung gestoppt · Backup nicht bestätigt');
+                  return false;
+                }
+
+                const pruned=dp37aPruneState();
+                dp37aRender();
+
+                const [dpbRows,noticeRows,orderRows]=await Promise.all([
+                  dp37aQueryPrefix('DPB|'),
+                  dp37aQueryPrefix('DP|dispoNotices|'),
+                  dp37aQueryPrefix('DP|orders|')
+                ]);
+                const noticeIds=new Set(pruned.noticeIds);
+                const orderIds=new Set(pruned.orderIds);
+                const staleNotices=noticeRows.filter(r=>noticeIds.has(dp37aText(r.Title).slice('DP|dispoNotices|'.length)));
+                const staleOrders=orderRows.filter(r=>orderIds.has(dp37aText(r.Title).slice('DP|orders|'.length)));
+                const all=[...dpbRows,...staleNotices,...staleOrders];
+
+                const counts={legacyBackups:dpbRows.length,oldNotices:staleNotices.length,archivedOrders:staleOrders.length,total:all.length};
+                if(!all.length){
+                  dp37aLastResult={at:new Date().toISOString(),...counts,removed:0};
+                  dp37aStatus('✓ DP_Data sauber · keine bereinigbaren Altzeilen');
+                  return true;
+                }
+
+                dp37aBanner('DP_Data wird sicher bereinigt: '+all.length+' eindeutig entbehrliche Altzeilen. Aktuelles Backup ist bestätigt.');
+                const removed=await dp37aRemoveRows(all,function(done,total){
+                  dp37aStatus('DP_Data Bereinigung '+done+'/'+total+' …');
+                });
+
+                dp37aLastResult={at:new Date().toISOString(),...counts,removed};
+                dp37aBanner(
+                  'DP_Data bereinigt: '+removed+' Zeilen entfernt · '+counts.legacyBackups+' alte DPB-Backups · '+counts.oldNotices+' alte bestätigte Meldungen · '+counts.archivedOrders+' sicher archivierte Auftragszeilen.'
+                );
+                dp37aStatus('✓ DP_Data bereinigt · '+removed+' Altzeilen entfernt');
+                setTimeout(()=>dp37aBanner(''),15000);
+                return true;
+              })().catch(function(e){
+                dp37aBanner('DP_Data-Bereinigung unterbrochen. Bereits sicher entfernte Altzeilen bleiben entfernt; Rest wird später erneut geprüft.',true);
+                dp37aStatus('⚠ DP_Data-Bereinigung unterbrochen · späterer neuer Versuch');
+                console.warn('DLB-037A Housekeeping Fehler',e);
+                dp37aSchedule(2*60*1000);
+                return false;
+              }).finally(function(){dp37aRunning=null;});
+
+              return dp37aRunning;
+            }
+
+            if(dp37aBaseLoadState){
+              loadState=async function(){
+                const r=await dp37aBaseLoadState.apply(this,arguments);
+                if(dp37aOnline()&&!dp37aOutboxPending())dp37aSchedule(1500);
+                return r;
+              };
+            }
+
+            window.addEventListener('online',function(){dp37aSchedule(2500);});
+            dp37aIntervalTimer=setInterval(function(){
+              if(dp37aOnline()&&!dp37aOutboxPending())dp37aHousekeeping().catch(()=>undefined);
+            },dp37aIntervalMs);
+            dp37aSchedule(2500);
+
+            window.__DISPOLUX_037A={
+              version:'1.16.0.21',
+              run:dp37aHousekeeping,
+              lastResult:function(){return dp37aLastResult;},
+              noticeRetentionHours:72
+            };
+          })();
+          /* DP_DLB_037A_1_16_0_21_DP_DATA_HYGIENE_END */
+          """
+
+          pf=Path('/tmp/dlb037a_patch.js')
+          pf.write_text(patch,encoding='utf-8',newline='\n')
+          subprocess.run(['node','--check',str(pf)],check=True)
+
+          src=src.replace(end_marker,patch+'\n\n'+end_marker,1)
+          runtime.write_text(src,encoding='utf-8',newline='\n')
+          if runtime.suffix=='.js':subprocess.run(['node','--check',str(runtime)],check=True)
+          print('037A: sichere DP_Data-Hygiene in geprüfte 036D-Runtime eingefügt:',runtime)
+          PY_PATCH_037A
+
+      - name: Set 037A SPFx version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VER_037A'
+          from pathlib import Path
+          p=Path('spfx-build/config/package-solution.json')
+          src=p.read_text(encoding='utf-8')
+          if src.count('1.3.6.114')!=1:
+              raise SystemExit(f"037A: erwartete 036D-SPFx-Version 1.3.6.114 genau einmal, gefunden {src.count('1.3.6.114')}x.")
+          p.write_text(src.replace('1.3.6.114','1.3.6.115',1),encoding='utf-8',newline='\n')
+          PY_VER_037A
+
+      - name: Validate 037A source before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VALIDATE_037A'
+          from pathlib import Path
+          import json,re,subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          begin='DP_DLB_037A_1_16_0_21_DP_DATA_HYGIENE_BEGIN'
+          end='DP_DLB_037A_1_16_0_21_DP_DATA_HYGIENE_END'
+          hits=[]; combined=[]
+          for p in files:
+              s=p.read_text(encoding='utf-8'); combined.append(s)
+              if begin in s:hits.append((p,s))
+          if len(hits)!=1:raise SystemExit(f'037A VALIDIERUNG: Patch in {len(hits)} Dateien statt genau 1 gefunden.')
+          runtime,src=hits[0]
+          if src.count(begin)!=1 or src.count(end)!=1:raise SystemExit('037A VALIDIERUNG: Patchmarker nicht eindeutig.')
+          frag=src.split(begin,1)[1].split(end,1)[0]
+          all_text='\n'.join(combined)
+
+          required=[
+              'dp37aEnsureFreshBackup','dpDispoLuxBackupNow','dpDispoLuxBackupStatus',
+              "dp37aQueryPrefix('DPB|')","dp37aQueryPrefix('DP|dispoNotices|')","dp37aQueryPrefix('DP|orders|')",
+              'dp37aNoticeRetentionMs=72*60*60*1000','dp37aPruneState','dp37aArchiveKey','exactArchive',
+              "['ausgeführt','nicht ausgeführt','storniert','abgebrochen']",
+              'SPStore.remove({id,title})','dp37aOutboxPending','__DISPOLUX_036D','version:\'1.16.0.21\''
+          ]
+          missing=[x for x in required if x not in frag and x!='__DISPOLUX_036D']
+          if '__DISPOLUX_036D' not in all_text:missing.append('__DISPOLUX_036D')
+          if missing:raise SystemExit('037A VALIDIERUNG Pflichtbestandteile fehlen: '+', '.join(missing))
+
+          # Harte Sicherheitsregeln: Archivzeile nur entfernen, wenn Status + archivedAt exakt im Archiv vorkommen.
+          for safety in ['o.archivedAt','dp37aFinalStatus(o.status)','exactArchive.has(dp37aArchiveKey(o))','backupOk=await dp37aEnsureFreshBackup()']:
+              if safety not in frag:raise SystemExit('037A VALIDIERUNG Sicherheitsregel fehlt: '+safety)
+
+          basis=[
+              'DP_DLB_036D_1_16_0_20_OFFLINE_OUTBOX_SYNC_BEGIN',
+              'DP_DLB_035B_1_16_0_16_AUFTRAG_KONTAKT_MEHRMULDEN_MATERIAL_BEGIN',
+              'DP_DLB_034D_1_16_0_15_DP_DATA_STAMMDATEN_PERSISTENZ_BEGIN',
+              'DP_DLB_030AH_1_12_1_27_BACKUP_30MIN_FILES_BEGIN',
+              'DispoLux_Backup','warehouses','transportLocations','plannedBinMaterials','actualBinMaterials'
+          ]
+          miss=[x for x in basis if x not in all_text]
+          if miss:raise SystemExit('037A VALIDIERUNG Basis unvollständig: '+', '.join(miss))
+
+          if 'await dp28dBackup(fields, rows, force);' in all_text:raise SystemExit('037A VALIDIERUNG: alter DPB-Schreibaufruf wieder aktiv.')
+          pkg=json.loads(Path('spfx-build/config/package-solution.json').read_text(encoding='utf-8'))
+          if pkg.get('solution',{}).get('version')!='1.3.6.115':raise SystemExit('037A VALIDIERUNG: falsche SPFx-Version.')
+          if runtime.suffix=='.js':subprocess.run(['node','--check',str(runtime)],check=True)
+
+          print('037A VALIDIERUNG OK')
+          print('- Basis exakt DLB-036D')
+          print('- Löschung erst nach bestätigter Dateisicherung')
+          print('- alte DPB-Zeilen werden aus DP_Data entfernt')
+          print('- bestätigte/unterdrückte Meldungen erst nach 72 Stunden entfernt')
+          print('- aktive Auftragszeile nur bei exakter finaler Archivkopie (ID + Status + archivedAt) entfernt')
+          print('- Offline-Warteschlange blockiert Housekeeping')
+          PY_VALIDATE_037A
+
+      - name: Build and package 037A
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf spfx-build/release spfx-build/temp/deploy spfx-build/sharepoint/solution
+          (cd spfx-build && npx heft build --production)
+          (cd spfx-build && npx heft package-solution --production)
+
+          rm -rf artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n1); test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+          if [ -d spfx-build/release/assets ]; then cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/; \
+          elif [ -d spfx-build/temp/deploy ]; then cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/; \
+          else echo '037A: Keine SPFx Asset-Ausgabe gefunden.' >&2; exit 1; fi
+          if [ -f .dpx14_icon_b64 ]; then
+            python3 - <<'PY_ICON_037A'
+          from pathlib import Path
+          import base64
+          Path('artifact/UPLOAD_TO_SITEASSETS/DispoLux_DL_Icon_48.png').write_bytes(base64.b64decode(Path('.dpx14_icon_b64').read_text().strip()))
+          PY_ICON_037A
+          fi
+
+      - name: Validate emitted 037A package
+        shell: bash
+        run: |
+          set -euo pipefail
+          COUNT=0
+          while IFS= read -r -d '' JS; do test -s "$JS"; node --check "$JS"; COUNT=$((COUNT+1)); done < <(find artifact/UPLOAD_TO_SITEASSETS -maxdepth 1 -type f -name '*.js' -print0)
+          test "$COUNT" -gt 0
+          test -s artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          python3 - <<'PY_FINAL_037A'
+          from pathlib import Path
+          import re
+          assets=Path('artifact/UPLOAD_TO_SITEASSETS'); js=list(assets.glob('*.js'))
+          current=[]
+          for p in js:
+              s=p.read_text(encoding='utf-8')
+              if '__DISPOLUX_037A' in s:current.append((p,s))
+          if len(current)!=1:raise SystemExit(f'037A FINAL: aktueller Produktionsbundle {len(current)}x statt 1x gefunden: {[p.name for p,_ in current]}')
+          p,s=current[0]
+          required=[
+              '__DISPOLUX_036D','__DISPOLUX_037A','DispoLux:036D:offlineOutbox:v1','DispoLux_Backup',
+              'DP_Data bereinigt','72*60*60*1000','DP|dispoNotices|','DP|orders|','DPB|',
+              'warehouses','transportLocations','plannedBinMaterials','actualBinMaterials','Telefon Baustelle','Standort setzen'
+          ]
+          missing=[x for x in required if x not in s]
+          if missing:raise SystemExit('037A FINAL: Pflichtbestandteile fehlen: '+', '.join(missing))
+          sections=list(re.finditer(r"sectionKeys\s*:\s*\[([^\]]*)\]",s))
+          if not sections:raise SystemExit('037A FINAL: keine sectionKeys gefunden.')
+          for idx,m in enumerate(sections,1):
+              keys=set(re.findall(r"['\"]([^'\"]+)['\"]",m.group(1)))
+              miss=[k for k in ('warehouses','transportLocations') if k not in keys]
+              if miss:raise SystemExit(f'037A FINAL: sectionKeys #{idx} unvollständig: {miss}')
+          stale=[]
+          for q in js:
+              if q==p:continue
+              x=q.read_text(encoding='utf-8')
+              if 'sectionKeys' in x and 'DP_Data' in x:stale.append(q.name)
+          if stale:raise SystemExit('037A FINAL: alte DP_Data-WebPart-Bundles im Auslieferungsordner: '+repr(stale))
+          print('037A FINAL OK')
+          print('- aktuelle 036D Offline-Outbox erhalten')
+          print('- sichere DP_Data-Bereinigung enthalten')
+          print('- keine alten DP_Data-WebPart-Bundles im Auslieferungsordner')
+          PY_FINAL_037A
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DLB-037A-1.16.0.21 · DP_DATA HYGIENE / SICHERE ALTDATEN-BEREINIGUNG · SPFx 1.3.6.115
+
+          Basis:
+          - getesteter DLB-036D-1.16.0.20
+          - Offline-Outbox / Reconnect-Merge aus 036D vollständig erhalten
+          - 035B Auftrags-/Kontakt-/Mehrmulden-Funktionen erhalten
+          - 034D Stammdaten-Persistenz erhalten
+          - 030AH 30-Minuten-Dateibackup in DispoLux_Backup erhalten
+
+          037A bereinigt ausschließlich eindeutig entbehrliche DP_Data-Zeilen:
+          - alte DPB|...-Backupzeilen aus dem früheren Backupverfahren
+          - dispoNotices erst nach 72 Stunden und nur wenn bestätigt oder unterdrückt
+          - DP|orders|-Zeile nur, wenn der Auftrag final ist, archivedAt besitzt und im archiveOrders exakt dieselbe Kombination aus ID + Status + archivedAt vorhanden ist
+          - nicht eindeutig archivierte Aufträge bleiben unangetastet
+          - archiveOrders selbst wird in 037A NICHT dedupliziert oder verändert
+          - bei aktiver 036D-Offline-Warteschlange läuft keine Bereinigung
+          - vor jeder Löschrunde muss eine aktuelle Dateisicherung bestätigt sein; ohne bestätigtes Backup wird NICHT gelöscht
+          - Löschungen sind gedrosselt und können nach Unterbrechung beim nächsten Lauf fortgesetzt werden
+
+          Erwartung anhand DP_Data-Export vom 06.10.2026 (nur Orientierung, aktueller Bestand kann abweichen):
+          - 594 alte DPB-Backupzeilen
+          - ca. 319 alte bestätigte Meldungen >72 h
+          - ca. 156 aktive Auftragszeilen mit exakt bestätigter finaler Archivkopie
+          - damit rund 1.069 eindeutig entbehrliche Zeilen von damals 1.202
+          - die 13/14 nicht sauber im Archiv nachweisbaren Altaufträge werden ausdrücklich NICHT gelöscht
+
+          Praxistest:
+          1. 036D muss vorher normal online funktionieren; keine offene Offline-Warteschlange.
+          2. 037A installieren und DispoLux online öffnen.
+          3. Zuerst muss die Dateisicherung bestätigt werden. Schlägt sie fehl, darf DP_Data nicht bereinigt werden.
+          4. Danach kann die Bereinigung einige Minuten laufen; Status zeigt Fortschritt.
+          5. DP_Data-Anzahl anschließend prüfen. Sie sollte stark sinken.
+          6. Aktuelle/geplante Aufträge, Kunden, Baustellen, Mulden, Lagerplätze und Transportorte prüfen.
+          7. Archiv prüfen: ausgeführte Altaufträge müssen weiterhin im Archiv vorhanden sein.
+          8. Einen neuen Testauftrag anlegen/ändern/ausführen und prüfen, dass er normal gespeichert wird.
+          9. Flugmodus-Test aus 036D wiederholen: Offline-Eingabe muss weiterhin vorgemerkt und nach Reconnect übertragen werden.
+          10. Backup-Bibliothek DispoLux_Backup prüfen: aktuelle JSON-Sicherung muss vorhanden sein.
+          TXT
+
+          cat > artifact/DISPOLUX_THEMENREGISTER_ERGAENZUNG_037A.csv <<'CSV'
+          Bereich;Änderung;Build;Status
+          DP_Data / Datenhaltung;Alte DPB-Backupzeilen nach bestätigter Dateisicherung physisch entfernen;DLB-037A;Umgesetzt
+          DP_Data / Datenhaltung;Bestätigte oder unterdrückte Dispo-Meldungen nach 72 Stunden entfernen;DLB-037A;Umgesetzt
+          DP_Data / Datenhaltung;Final archivierte Auftragszeilen nur bei exakter Archivkopie ID+Status+archivedAt entfernen;DLB-037A;Umgesetzt
+          DP_Data / Sicherheit;Nicht eindeutig archivierte Aufträge niemals automatisch löschen;DLB-037A;Umgesetzt
+          DP_Data / Sicherheit;Housekeeping bei aktiver Offline-Warteschlange sperren;DLB-037A;Umgesetzt
+          DP_Data / Sicherheit;Vor Löschung aktuelle Dateisicherung erzwingen/bestätigen;DLB-037A;Umgesetzt
+          CSV
+
+          echo '037A: Produktions-JS syntaktisch gültig; SPPKG vorhanden; sichere DP_Data-Hygiene und 036D-Basis geprüft.'
+
+      - name: Upload DLB-037A artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-037A-1.16.0.21-DP-DATA-HYGIENE-SAFE-CLEANUP-SPFX-1.3.6.115
+          path: artifact/
+          if-no-files-found: error
