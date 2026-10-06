@@ -1,0 +1,306 @@
+name: DLB-037B-1.16.0.22 DP DATA HYGIENE SAFE CLEANUP FULL BUILD
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/DLB-037B-1.16.0.22_DP_DATA_HYGIENE_SAFE_CLEANUP_FULL_BUILD.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Rebuild 037A implementation from tested 036D basis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY_RUN_037A_IMPL'
+          from pathlib import Path
+          import subprocess
+          import yaml
+
+          wf=Path('.github/workflows/DLB-037A-1.16.0.21_DP_DATA_HYGIENE_SAFE_CLEANUP_FULL_BUILD.yml')
+          if not wf.exists():
+              raise SystemExit('037B: 037A-Workflow fehlt im Repository.')
+
+          doc=yaml.safe_load(wf.read_text(encoding='utf-8'))
+          runs=[(s.get('name',''),s.get('run')) for s in doc['jobs']['build']['steps'] if s.get('run')]
+          if len(runs)!=6:
+              raise SystemExit(f'037B: 037A erwartet 6 ausführbare Schritte, gefunden {len(runs)}.')
+
+          # Nur die Implementierung aus 037A verwenden:
+          # 1 Basis 036D, 2 Housekeeping-Patch, 3 Versionssatz 037A, 4 Quellvalidierung.
+          # Den fehlerhaften finalen 037A-Bundlecheck NICHT übernehmen.
+          for idx,(name,script) in enumerate(runs[:4],1):
+              print(f'===== 037B übernimmt 037A-Implementierung Schritt {idx}/4: {name} =====')
+              runner=Path(f'.037b_037a_impl_{idx}.sh')
+              runner.write_text(script,encoding='utf-8',newline='\n')
+              try:
+                  subprocess.run(['bash','-euo','pipefail',str(runner)],check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+
+          print('037B: 037A-Housekeeping-Implementierung auf getesteter 036D-Basis rekonstruiert; fehlerhafter 037A-Finalcheck wurde nicht ausgeführt.')
+          PY_RUN_037A_IMPL
+
+      - name: Promote implementation to DLB-037B
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PROMOTE_037B'
+          from pathlib import Path
+          import json
+          import subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          old_marker='DP_DLB_037A_1_16_0_21_DP_DATA_HYGIENE_BEGIN'
+          new_marker='DP_DLB_037B_1_16_0_22_DP_DATA_HYGIENE_BEGIN'
+
+          hits=[]
+          for p in files:
+              s=p.read_text(encoding='utf-8')
+              if old_marker in s:hits.append((p,s))
+          if len(hits)!=1:
+              raise SystemExit(f'037B: 037A-Housekeeping-Runtime {len(hits)}x statt genau 1x gefunden.')
+
+          runtime,s=hits[0]
+          replacements={
+              'DP_DLB_037A_1_16_0_21_DP_DATA_HYGIENE_BEGIN':'DP_DLB_037B_1_16_0_22_DP_DATA_HYGIENE_BEGIN',
+              'DP_DLB_037A_1_16_0_21_DP_DATA_HYGIENE_END':'DP_DLB_037B_1_16_0_22_DP_DATA_HYGIENE_END',
+              '__DISPOLUX_037A':'__DISPOLUX_037B',
+              "version:'1.16.0.21'":"version:'1.16.0.22'",
+              'DLB-037A':'DLB-037B',
+          }
+          for old,new in replacements.items():
+              s=s.replace(old,new)
+
+          if old_marker in s or '__DISPOLUX_037A' in s or "version:'1.16.0.21'" in s:
+              raise SystemExit('037B: alte 037A-Laufzeitkennung blieb nach Promotion erhalten.')
+          if new_marker not in s or '__DISPOLUX_037B' not in s or "version:'1.16.0.22'" not in s:
+              raise SystemExit('037B: neue Laufzeitkennung unvollständig.')
+
+          runtime.write_text(s,encoding='utf-8',newline='\n')
+          if runtime.suffix=='.js':subprocess.run(['node','--check',str(runtime)],check=True)
+
+          pkg=Path('spfx-build/config/package-solution.json')
+          data=json.loads(pkg.read_text(encoding='utf-8'))
+          if data.get('solution',{}).get('version')!='1.3.6.115':
+              raise SystemExit('037B: erwartete 037A-Zwischenversion 1.3.6.115 fehlt.')
+          data['solution']['version']='1.3.6.116'
+          pkg.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+
+          print('037B: Housekeeping-Patch auf 1.16.0.22 / SPFx 1.3.6.116 angehoben.')
+          PY_PROMOTE_037B
+
+      - name: Validate 037B source before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VALIDATE_037B'
+          from pathlib import Path
+          import json
+          import re
+          import subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          begin='DP_DLB_037B_1_16_0_22_DP_DATA_HYGIENE_BEGIN'
+          end='DP_DLB_037B_1_16_0_22_DP_DATA_HYGIENE_END'
+          hits=[]; combined=[]
+          for p in files:
+              s=p.read_text(encoding='utf-8'); combined.append(s)
+              if begin in s:hits.append((p,s))
+          if len(hits)!=1:
+              raise SystemExit(f'037B VALIDIERUNG: Patch {len(hits)}x statt genau 1x gefunden.')
+          runtime,s=hits[0]
+          if s.count(begin)!=1 or s.count(end)!=1:
+              raise SystemExit('037B VALIDIERUNG: Patchmarker nicht eindeutig.')
+          frag=s.split(begin,1)[1].split(end,1)[0]
+          all_text='\n'.join(combined)
+
+          required=[
+              "version:'1.16.0.22'",
+              'dp37aNoticeRetentionMs=72*60*60*1000',
+              'noticeRetentionHours:72',
+              'DP|dispoNotices|','DP|orders|','DPB|',
+              'dp37aHousekeeping','dp37aBackupFresh','dp37aOutboxPending',
+              'Nicht eindeutig archivierte Aufträge',
+              'DP_Data bereinigt',
+              'dpDispoLuxBackupNow',
+          ]
+          missing=[x for x in required if x not in frag and x not in all_text]
+          if missing:raise SystemExit('037B VALIDIERUNG: Pflichtbestandteile fehlen: '+', '.join(missing))
+
+          basis=[
+              'DP_DLB_036D_1_16_0_20_OFFLINE_OUTBOX_SYNC_BEGIN',
+              'DP_DLB_035B_1_16_0_16_AUFTRAG_KONTAKT_MEHRMULDEN_MATERIAL_BEGIN',
+              'DP_DLB_034D_1_16_0_15_DP_DATA_STAMMDATEN_PERSISTENZ_BEGIN',
+              'DispoLux:036D:offlineOutbox:v1','DispoLux_Backup',
+              'warehouses','transportLocations','plannedBinMaterials','actualBinMaterials','Telefon Baustelle','Standort setzen'
+          ]
+          missing=[x for x in basis if x not in all_text]
+          if missing:raise SystemExit('037B VALIDIERUNG: bewährte Basis unvollständig: '+', '.join(missing))
+
+          if '__DISPOLUX_037A' in all_text or 'DP_DLB_037A_1_16_0_21_DP_DATA_HYGIENE_BEGIN' in all_text:
+              raise SystemExit('037B VALIDIERUNG: alter 037A-Laufzeitmarker noch aktiv.')
+
+          sections=list(re.finditer(r"sectionKeys\s*:\s*\[([^\]]*)\]",s))
+          if not sections:raise SystemExit('037B VALIDIERUNG: keine sectionKeys gefunden.')
+          for idx,m in enumerate(sections,1):
+              keys=set(re.findall(r"['\"]([^'\"]+)['\"]",m.group(1)))
+              miss=[k for k in ('warehouses','transportLocations') if k not in keys]
+              if miss:raise SystemExit(f'037B VALIDIERUNG: sectionKeys #{idx} unvollständig: {miss}')
+
+          pkg=json.loads(Path('spfx-build/config/package-solution.json').read_text(encoding='utf-8'))
+          if pkg.get('solution',{}).get('version')!='1.3.6.116':
+              raise SystemExit('037B VALIDIERUNG: SPFx-Version ist nicht 1.3.6.116.')
+          if runtime.suffix=='.js':subprocess.run(['node','--check',str(runtime)],check=True)
+
+          print('037B VALIDIERUNG OK')
+          print('- Basis 036D erhalten')
+          print('- 72-Stunden-Regel im Quellcode geprüft')
+          print('- sichere Archivprüfung / Backup-Sperre / Offline-Sperre enthalten')
+          PY_VALIDATE_037B
+
+      - name: Build and package 037B
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf spfx-build/release spfx-build/temp/deploy spfx-build/sharepoint/solution
+          (cd spfx-build && npx heft build --production)
+          (cd spfx-build && npx heft package-solution --production)
+
+          rm -rf artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n1); test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+          if [ -d spfx-build/release/assets ]; then cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/; \
+          elif [ -d spfx-build/temp/deploy ]; then cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/; \
+          else echo '037B: Keine SPFx Asset-Ausgabe gefunden.' >&2; exit 1; fi
+          if [ -f .dpx14_icon_b64 ]; then
+            python3 - <<'PY_ICON_037B'
+          from pathlib import Path
+          import base64
+          Path('artifact/UPLOAD_TO_SITEASSETS/DispoLux_DL_Icon_48.png').write_bytes(base64.b64decode(Path('.dpx14_icon_b64').read_text().strip()))
+          PY_ICON_037B
+          fi
+
+      - name: Validate emitted 037B package
+        shell: bash
+        run: |
+          set -euo pipefail
+          COUNT=0
+          while IFS= read -r -d '' JS; do test -s "$JS"; node --check "$JS"; COUNT=$((COUNT+1)); done < <(find artifact/UPLOAD_TO_SITEASSETS -maxdepth 1 -type f -name '*.js' -print0)
+          test "$COUNT" -gt 0
+          test -s artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          python3 - <<'PY_FINAL_037B'
+          from pathlib import Path
+          import re
+          assets=Path('artifact/UPLOAD_TO_SITEASSETS'); js=list(assets.glob('*.js'))
+          current=[]
+          for p in js:
+              s=p.read_text(encoding='utf-8')
+              if '__DISPOLUX_037B' in s:current.append((p,s))
+          if len(current)!=1:raise SystemExit(f'037B FINAL: aktueller Produktionsbundle {len(current)}x statt 1x gefunden: {[p.name for p,_ in current]}')
+          p,s=current[0]
+
+          # Nur minifizierungsstabile Merkmale prüfen. Der 037A-Fehler entstand,
+          # weil der Optimierer 72*60*60*1000 zu einer Zahl zusammengefaltet hat.
+          required=[
+              '__DISPOLUX_036D','__DISPOLUX_037B','DispoLux:036D:offlineOutbox:v1','DispoLux_Backup',
+              'DP_Data bereinigt','noticeRetentionHours','DP|dispoNotices|','DP|orders|','DPB|',
+              'warehouses','transportLocations','plannedBinMaterials','actualBinMaterials','Telefon Baustelle','Standort setzen'
+          ]
+          missing=[x for x in required if x not in s]
+          if missing:raise SystemExit('037B FINAL: Pflichtbestandteile fehlen: '+', '.join(missing))
+          if '__DISPOLUX_037A' in s:raise SystemExit('037B FINAL: alter 037A-Laufzeitmarker im Produktionsbundle gefunden.')
+
+          sections=list(re.finditer(r"sectionKeys\s*:\s*\[([^\]]*)\]",s))
+          if not sections:raise SystemExit('037B FINAL: keine sectionKeys gefunden.')
+          for idx,m in enumerate(sections,1):
+              keys=set(re.findall(r"['\"]([^'\"]+)['\"]",m.group(1)))
+              miss=[k for k in ('warehouses','transportLocations') if k not in keys]
+              if miss:raise SystemExit(f'037B FINAL: sectionKeys #{idx} unvollständig: {miss}')
+
+          stale=[]
+          for q in js:
+              if q==p:continue
+              x=q.read_text(encoding='utf-8')
+              if 'sectionKeys' in x and 'DP_Data' in x:stale.append(q.name)
+          if stale:raise SystemExit('037B FINAL: alte DP_Data-WebPart-Bundles im Auslieferungsordner: '+repr(stale))
+
+          print('037B FINAL OK')
+          print('- 036D Offline-Outbox erhalten')
+          print('- sichere DP_Data-Bereinigung enthalten')
+          print('- Finalprüfung verwendet nur minifizierungsstabile Kennzeichen')
+          PY_FINAL_037B
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DLB-037B-1.16.0.22 · DP_DATA HYGIENE / SICHERE ALTDATEN-BEREINIGUNG · SPFx 1.3.6.116
+
+          Basis:
+          - getesteter DLB-036D-1.16.0.20
+          - Offline-Outbox / Reconnect-Merge aus 036D vollständig erhalten
+          - 035B Auftrags-/Kontakt-/Mehrmulden-Funktionen erhalten
+          - 034D Stammdaten-Persistenz erhalten
+          - 030AH 30-Minuten-Dateibackup in DispoLux_Backup erhalten
+
+          037B bereinigt ausschließlich eindeutig entbehrliche DP_Data-Zeilen:
+          - alte DPB|...-Backupzeilen aus dem früheren Backupverfahren
+          - dispoNotices erst nach 72 Stunden und nur wenn bestätigt oder unterdrückt
+          - DP|orders|-Zeile nur bei finalem Auftrag mit archivedAt und exakt passender Archivkopie ID + Status + archivedAt
+          - nicht eindeutig archivierte Aufträge bleiben unangetastet
+          - archiveOrders selbst wird nicht verändert
+          - bei aktiver 036D-Offline-Warteschlange läuft keine Bereinigung
+          - vor jeder Löschrunde muss eine aktuelle Dateisicherung bestätigt sein
+          - Löschungen sind gedrosselt und können nach Unterbrechung fortgesetzt werden
+
+          Korrektur gegenüber fehlgeschlagenem 037A:
+          - 037A scheiterte ausschließlich im finalen Prüfskript, weil die Minifizierung den Ausdruck 72*60*60*1000 zusammengefaltet hat.
+          - 037B prüft den 72-Stunden-Ausdruck vor dem Build im Quellcode.
+          - Im minifizierten Produktionsbundle werden nur stabile Funktions-/Eigenschaftskennzeichen geprüft.
+
+          Praxistest:
+          1. 037B installieren und DispoLux online öffnen; keine offene Offline-Warteschlange.
+          2. Zuerst muss die Dateisicherung bestätigt werden. Ohne bestätigtes Backup darf nichts gelöscht werden.
+          3. Bereinigung laufen lassen; DP_Data-Anzahl anschließend prüfen.
+          4. Aktuelle/geplante Aufträge, Kunden, Baustellen, Mulden, Lagerplätze und Transportorte prüfen.
+          5. Archiv prüfen: ausgeführte Altaufträge müssen weiterhin vorhanden sein.
+          6. Neuen Testauftrag anlegen/ändern/ausführen und Speicherung prüfen.
+          7. Flugmodus-Test aus 036D wiederholen.
+          8. DispoLux_Backup prüfen: aktuelle JSON-Sicherung muss vorhanden sein.
+          TXT
+
+          cat > artifact/DISPOLUX_THEMENREGISTER_ERGAENZUNG_037B.csv <<'CSV'
+          Bereich;Änderung;Build;Status
+          DP_Data / Datenhaltung;Alte DPB-Backupzeilen nach bestätigter Dateisicherung physisch entfernen;DLB-037B;Umgesetzt
+          DP_Data / Datenhaltung;Bestätigte oder unterdrückte Dispo-Meldungen nach 72 Stunden entfernen;DLB-037B;Umgesetzt
+          DP_Data / Datenhaltung;Final archivierte Auftragszeilen nur bei exakter Archivkopie ID+Status+archivedAt entfernen;DLB-037B;Umgesetzt
+          DP_Data / Sicherheit;Nicht eindeutig archivierte Aufträge niemals automatisch löschen;DLB-037B;Umgesetzt
+          DP_Data / Sicherheit;Housekeeping bei aktiver Offline-Warteschlange sperren;DLB-037B;Umgesetzt
+          DP_Data / Sicherheit;Vor Löschung aktuelle Dateisicherung erzwingen/bestätigen;DLB-037B;Umgesetzt
+          CSV
+
+          echo '037B: Produktions-JS syntaktisch gültig; SPPKG vorhanden; sichere DP_Data-Hygiene und 036D-Basis geprüft.'
+
+      - name: Upload DLB-037B artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-037B-1.16.0.22-DP-DATA-HYGIENE-SAFE-CLEANUP-SPFX-1.3.6.116
+          path: artifact/
+          if-no-files-found: error
