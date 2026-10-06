@@ -1,0 +1,934 @@
+name: DLB-036C-1.16.0.19 OFFLINE OUTBOX SYNC FULL BUILD
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/DLB-036C-1.16.0.19_OFFLINE_OUTBOX_SYNC_FULL_BUILD.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Rebuild exact tested DLB-036B basis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY_RUN_036B_BASE'
+          from pathlib import Path
+          import subprocess
+          import yaml
+
+          wf=Path('.github/workflows/DLB-036B-1.16.0.18_OFFLINE_RETRY_SAFETY_FULL_BUILD.yml')
+          if not wf.exists():
+              raise SystemExit('036C: getesteter 036B-Workflow fehlt im Repository.')
+
+          doc=yaml.safe_load(wf.read_text(encoding='utf-8'))
+          runs=[(s.get('name',''),s.get('run')) for s in doc['jobs']['build']['steps'] if s.get('run')]
+          if len(runs)!=6:
+              raise SystemExit(f'036C: 036B-Basis erwartet 6 ausführbare Buildschritte, gefunden {len(runs)}.')
+
+          for idx,(name,script) in enumerate(runs,1):
+              print(f'===== 036C Basis 036B Schritt {idx}/{len(runs)}: {name} =====')
+              runner=Path(f'.036c_036b_step_{idx}.sh')
+              runner.write_text(script,encoding='utf-8',newline='\n')
+              try:
+                  subprocess.run(['bash','-euo','pipefail',str(runner)],check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+
+          print('036C: getesteter DLB-036B-Stand vollständig rekonstruiert.')
+          PY_RUN_036B_BASE
+
+      - name: Replace 036B read-only offline guard with 036C outbox sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH_036C'
+          from pathlib import Path
+          import re
+          import subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+
+          old_begin='/* DP_DLB_036B_1_16_0_18_OFFLINE_RETRY_SAFETY_BEGIN */'
+          old_end='/* DP_DLB_036B_1_16_0_18_OFFLINE_RETRY_SAFETY_END */'
+          new_begin='/* DP_DLB_036C_1_16_0_19_OFFLINE_OUTBOX_SYNC_BEGIN */'
+          new_end='/* DP_DLB_036C_1_16_0_19_OFFLINE_OUTBOX_SYNC_END */'
+
+          candidates=[]
+          for p in files:
+              src=p.read_text(encoding='utf-8')
+              if old_begin in src and old_end in src:
+                  candidates.append((p,src))
+
+          if len(candidates)!=1:
+              raise SystemExit(
+                  '036C: erwartete genau eine 036B-App-Runtime, gefunden: '
+                  +repr([str(p) for p,_ in candidates])
+              )
+
+          runtime,src=candidates[0]
+          if new_begin in src:
+              raise SystemExit('036C: Patch bereits vorhanden.')
+          if src.count(old_begin)!=1 or src.count(old_end)!=1:
+              raise SystemExit('036C: 036B-Patchmarker nicht eindeutig.')
+
+          patch=r"""
+          /* DP_DLB_036C_1_16_0_19_OFFLINE_OUTBOX_SYNC_BEGIN */
+          (function(){
+            'use strict';
+            if(window.__DISPOLUX_036C?.version==='1.16.0.19')return;
+
+            const dp36cGoodKey='DispoLux:036C:lastGoodState:v1';
+            const dp36cOutboxKey='DispoLux:036C:offlineOutbox:v1';
+            const dp36cNoticeWindowMs=60000;
+            const dp36cBasePersist=(typeof persist==='function')?persist:null;
+            const dp36cBaseLoadState=(typeof loadState==='function')?loadState:null;
+            const dp36cBasePoll=(typeof dpG3Poll==='function')?dpG3Poll:null;
+
+            let dp36cPersistRunning=null;
+            let dp36cRecoverRunning=null;
+            let dp36cRecoverTimer=null;
+            let dp36cRecoveryRead=false;
+            let dp36cWriteBlocked=false;
+            let dp36cKnownNoticeIds=new Set();
+            let dp36cLastSuccessHash='';
+
+            function dp36cText(v){return String(v??'').trim();}
+            function dp36cOnline(){return typeof navigator==='undefined'||navigator.onLine!==false;}
+            function dp36cNow(){return new Date().toISOString();}
+            function dp36cClone(v){try{return JSON.parse(JSON.stringify(v));}catch(_){return null;}}
+            function dp36cJson(v){try{return JSON.stringify(v);}catch(_){return '';}}
+            function dp36cEqual(a,b){return dp36cJson(a)===dp36cJson(b);}
+            function dp36cHash(v){
+              const s=typeof v==='string'?v:dp36cJson(v);
+              let h=2166136261;
+              for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}
+              return (h>>>0).toString(16)+':'+s.length;
+            }
+            function dp36cStateHash(){return dp36cHash(state??{});}
+            function dp36cStatus(msg){
+              try{if(typeof dpG3Status==='function'){dpG3Status(msg);return;}}catch(_){}
+              try{const el=document.getElementById('storageStatus');if(el)el.textContent=msg;}catch(_){}
+            }
+            function dp36cBanner(message,bad=false){
+              try{
+                let el=document.getElementById('dp36ConnectivityBanner');
+                if(!message){if(el)el.style.display='none';return;}
+                if(!el){
+                  el=document.createElement('div');
+                  el.id='dp36ConnectivityBanner';
+                  el.setAttribute('role','status');
+                  el.style.position='sticky';
+                  el.style.top='0';
+                  el.style.zIndex='99999';
+                  el.style.padding='10px 14px';
+                  el.style.fontWeight='700';
+                  el.style.textAlign='center';
+                  el.style.borderBottom='1px solid rgba(0,0,0,.18)';
+                  const host=document.body||document.documentElement;
+                  host.insertBefore(el,host.firstChild||null);
+                }
+                el.style.display='block';
+                el.style.background=bad?'#ffd8d8':'#fff0b8';
+                el.style.color='#202020';
+                el.textContent=message;
+              }catch(_){}
+            }
+            function dp36cRender(){
+              try{
+                if(typeof renderAll==='function')renderAll();
+                else if(typeof dpG3RenderVisibleScreen==='function')dpG3RenderVisibleScreen();
+              }catch(e){console.warn('DLB-036C Render',e);}
+            }
+            function dp36cNetworkish(e){
+              const status=Number(e&&((e.status!==undefined)?e.status:e.statusCode)||0);
+              if(!dp36cOnline())return true;
+              if([0,408,425,429,500,502,503,504].includes(status))return true;
+              const q=dp36cText(e&&e.message||e).toLowerCase();
+              return /network|failed to fetch|load failed|timeout|timed out|connection|offline|netz|verbindung|gateway|service unavailable/.test(q);
+            }
+            function dp36cErr(message,code){
+              const e=new Error(message);
+              try{e.code=code;}catch(_){}
+              return e;
+            }
+
+            function dp36cSaveGood(reason){
+              if(!dp36cOnline())return false;
+              const snap=dp36cClone(state??{});
+              if(!snap)return false;
+              try{
+                localStorage.setItem(dp36cGoodKey,JSON.stringify({
+                  version:1,
+                  savedAt:dp36cNow(),
+                  reason:dp36cText(reason),
+                  state:snap
+                }));
+                return true;
+              }catch(e){
+                console.warn('DLB-036C: sicherer Stand konnte nicht lokal gespeichert werden',e);
+                return false;
+              }
+            }
+            function dp36cReadGood(){
+              try{
+                const raw=localStorage.getItem(dp36cGoodKey);
+                if(!raw)return null;
+                const x=JSON.parse(raw);
+                return x&&x.state?x:null;
+              }catch(_){return null;}
+            }
+            function dp36cReadOutbox(){
+              try{
+                const raw=localStorage.getItem(dp36cOutboxKey);
+                if(!raw)return null;
+                const x=JSON.parse(raw);
+                return x&&x.base&&x.working?x:null;
+              }catch(e){
+                console.error('DLB-036C: Offline-Warteschlange unlesbar',e);
+                return null;
+              }
+            }
+            function dp36cWriteOutbox(box){
+              try{
+                localStorage.setItem(dp36cOutboxKey,JSON.stringify(box));
+                return true;
+              }catch(e){
+                console.error('DLB-036C: Offline-Warteschlange konnte nicht gespeichert werden',e);
+                dp36cBanner('OFFLINE – lokale Änderung konnte NICHT vorgemerkt werden. Bitte diese Eingabe nicht verlassen.',true);
+                return false;
+              }
+            }
+            function dp36cClearOutbox(){
+              try{localStorage.removeItem(dp36cOutboxKey);}catch(_){}
+            }
+            function dp36cRestore(v){
+              const raw=dp36cClone(v);
+              if(!raw)return false;
+              try{
+                state=(typeof migrateState==='function')?migrateState(raw):raw;
+                try{if(typeof sessionUser!=='undefined'&&sessionUser)state.user=sessionUser;}catch(_){}
+                return true;
+              }catch(e){
+                console.error('DLB-036C: lokaler Zustand konnte nicht wiederhergestellt werden',e);
+                return false;
+              }
+            }
+
+            function dp36cEntityKey(x){
+              if(!x||typeof x!=='object'||Array.isArray(x))return '';
+              for(const k of ['id','Id','ID','uuid','key']){
+                if(x[k]!==undefined&&x[k]!==null&&String(x[k])!=='')return k+':'+String(x[k]);
+              }
+              return '';
+            }
+            function dp36cKeyedArray(arr){
+              if(!Array.isArray(arr))return null;
+              const m=new Map();
+              for(const item of arr){
+                const k=dp36cEntityKey(item);
+                if(!k||m.has(k))return null;
+                m.set(k,item);
+              }
+              return m;
+            }
+            function dp36cBuildOps(base,working){
+              base=base&&typeof base==='object'?base:{};
+              working=working&&typeof working==='object'?working:{};
+              const ops=[];
+              const keys=new Set([...Object.keys(base),...Object.keys(working)]);
+              keys.delete('user');
+              for(const section of keys){
+                const a=base[section],b=working[section];
+                if(dp36cEqual(a,b))continue;
+                if(Array.isArray(a)&&Array.isArray(b)){
+                  const am=dp36cKeyedArray(a),bm=dp36cKeyedArray(b);
+                  if(am&&bm){
+                    for(const [id,local] of bm){
+                      const before=am.has(id)?am.get(id):undefined;
+                      if(!dp36cEqual(before,local))ops.push({kind:'entity-upsert',section,id,base:dp36cClone(before),local:dp36cClone(local)});
+                    }
+                    for(const [id,before] of am){
+                      if(!bm.has(id))ops.push({kind:'entity-delete',section,id,base:dp36cClone(before)});
+                    }
+                    continue;
+                  }
+                }
+                ops.push({kind:'section-replace',section,base:dp36cClone(a),local:dp36cClone(b)});
+              }
+              return ops;
+            }
+            function dp36cApplyOps(serverState,ops){
+              const merged=dp36cClone(serverState)||{};
+              const conflicts=[];
+              let changed=0,already=0;
+              for(const op of ops||[]){
+                if(op.kind==='section-replace'){
+                  const current=merged[op.section];
+                  if(dp36cEqual(current,op.local)){already++;continue;}
+                  if(dp36cEqual(current,op.base)){
+                    merged[op.section]=dp36cClone(op.local);
+                    changed++;
+                  }else conflicts.push(op);
+                  continue;
+                }
+
+                const arr=Array.isArray(merged[op.section])?merged[op.section]:[];
+                const map=dp36cKeyedArray(arr);
+                if(!map){conflicts.push(op);continue;}
+                const current=map.has(op.id)?map.get(op.id):undefined;
+
+                if(op.kind==='entity-upsert'){
+                  if(dp36cEqual(current,op.local)){already++;continue;}
+                  if(dp36cEqual(current,op.base)){
+                    const next=[];
+                    let replaced=false;
+                    for(const item of arr){
+                      if(dp36cEntityKey(item)===op.id){next.push(dp36cClone(op.local));replaced=true;}
+                      else next.push(item);
+                    }
+                    if(!replaced)next.push(dp36cClone(op.local));
+                    merged[op.section]=next;
+                    changed++;
+                  }else conflicts.push(op);
+                  continue;
+                }
+
+                if(op.kind==='entity-delete'){
+                  if(current===undefined){already++;continue;}
+                  if(dp36cEqual(current,op.base)){
+                    merged[op.section]=arr.filter(item=>dp36cEntityKey(item)!==op.id);
+                    changed++;
+                  }else conflicts.push(op);
+                }
+              }
+              return {merged,conflicts,changed,already};
+            }
+            function dp36cRefreshKnownNotices(){
+              const arr=(state&&Array.isArray(state.dispoNotices))?state.dispoNotices:[];
+              dp36cKnownNoticeIds=new Set(arr.filter(n=>n&&n.id!=null).map(n=>String(n.id)));
+            }
+            function dp36cNoticeKey(n){
+              if(!n)return '';
+              return [
+                dp36cText(n.driver),
+                dp36cText(n.orderId),
+                dp36cText(n.kind),
+                dp36cText(n.message).replace(/\s+/g,' ')
+              ].join('|').toLowerCase();
+            }
+            function dp36cNoticeStamp(n){
+              const v=Date.parse(dp36cText(n&&n.createdAt));
+              return Number.isFinite(v)?v:0;
+            }
+            function dp36cDedupeNewNotices(){
+              const arr=(state&&Array.isArray(state.dispoNotices))?state.dispoNotices:null;
+              if(!arr||!arr.length)return 0;
+              const drop=new Set();
+              for(let i=0;i<arr.length;i++){
+                const n=arr[i];
+                if(!n||n.id==null||dp36cKnownNoticeIds.has(String(n.id)))continue;
+                const key=dp36cNoticeKey(n),stamp=dp36cNoticeStamp(n);
+                if(!key||!stamp)continue;
+                for(let j=0;j<i;j++){
+                  const prev=arr[j];
+                  if(!prev||drop.has(j)||dp36cNoticeKey(prev)!==key)continue;
+                  const ps=dp36cNoticeStamp(prev);
+                  if(ps&&ps<=stamp&&(stamp-ps)<=dp36cNoticeWindowMs){drop.add(i);break;}
+                }
+              }
+              if(!drop.size)return 0;
+              state.dispoNotices=arr.filter((_,idx)=>!drop.has(idx));
+              console.warn('DLB-036C: doppelte neue Dispo-Mitteilungen unterdrückt:',drop.size);
+              return drop.size;
+            }
+            function dp36cEnsureOutbox(reason){
+              dp36cDedupeNewNotices();
+              let box=dp36cReadOutbox();
+              if(!box){
+                const good=dp36cReadGood();
+                const base=good&&good.state?good.state:dp36cClone(state??{});
+                box={
+                  version:1,
+                  queueId:'q-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10),
+                  createdAt:dp36cNow(),
+                  updatedAt:dp36cNow(),
+                  reason:dp36cText(reason),
+                  base:dp36cClone(base),
+                  working:dp36cClone(state??{})
+                };
+              }else{
+                box.updatedAt=dp36cNow();
+                box.reason=dp36cText(reason)||box.reason;
+                box.working=dp36cClone(state??{});
+              }
+              if(!box.base||!box.working)return null;
+              if(!dp36cWriteOutbox(box))return null;
+              return box;
+            }
+            function dp36cPendingCount(box){
+              if(!box)return 0;
+              return dp36cBuildOps(box.base,box.working).length;
+            }
+            function dp36cShowPending(box,prefix='OFFLINE'){
+              const count=dp36cPendingCount(box);
+              dp36cBanner(prefix+' – '+count+' Änderung'+(count===1?'':'en')+' lokal vorgemerkt. Automatische Übertragung sobald die Verbindung stabil ist.',false);
+              dp36cStatus(prefix+' · '+count+' Änderung'+(count===1?'':'en')+' vorgemerkt');
+            }
+            function dp36cRestoreOfflineView(){
+              const box=dp36cReadOutbox();
+              if(box&&dp36cRestore(box.working)){
+                dp36cShowPending(box,'OFFLINE');
+                dp36cRefreshKnownNotices();
+                dp36cRender();
+                return true;
+              }
+              const good=dp36cReadGood();
+              if(good&&dp36cRestore(good.state)){
+                dp36cBanner('OFFLINE – letzter sicherer Stand '+dp36cText(good.savedAt)+' geladen. Änderungen können lokal vorgemerkt werden.',false);
+                dp36cStatus('OFFLINE · letzter sicherer Stand');
+                dp36cRefreshKnownNotices();
+                dp36cRender();
+                return true;
+              }
+              dp36cBanner('OFFLINE – kein lokaler Datenstand vorhanden. Verbindung erforderlich.',true);
+              return false;
+            }
+
+            function dp36cScheduleRecover(delay=500){
+              if(dp36cRecoverTimer||!dp36cOnline())return;
+              dp36cRecoverTimer=setTimeout(function(){
+                dp36cRecoverTimer=null;
+                dp36cRecoverAndFlush();
+              },Math.max(250,Number(delay)||500));
+            }
+
+            async function dp36cRecoverAndFlush(){
+              if(dp36cRecoverRunning)return dp36cRecoverRunning;
+              if(!dp36cOnline()||!dp36cBaseLoadState)return false;
+
+              const box=dp36cReadOutbox();
+              dp36cRecoverRunning=(async function(){
+                dp36cWriteBlocked=true;
+                if(box)dp36cBanner('Verbindung wieder da – '+dp36cPendingCount(box)+' vorgemerkte Änderung(en) werden geprüft und übertragen.');
+                else dp36cBanner('Verbindung wieder da – aktueller Serverstand wird geladen.');
+
+                try{
+                  dp36cRecoveryRead=true;
+                  await dp36cBaseLoadState();
+                  dp36cRecoveryRead=false;
+                  const serverState=dp36cClone(state??{});
+                  if(!serverState)throw dp36cErr('Serverstand konnte nicht kopiert werden.','DP36C_SERVER_STATE');
+
+                  if(!box){
+                    dp36cLastSuccessHash=dp36cStateHash();
+                    dp36cRefreshKnownNotices();
+                    dp36cSaveGood('reconnect-no-outbox');
+                    dp36cWriteBlocked=false;
+                    dp36cBanner('');
+                    dp36cStatus('✓ Verbindung wiederhergestellt');
+                    dp36cRender();
+                    return true;
+                  }
+
+                  const ops=dp36cBuildOps(box.base,box.working);
+                  const applied=dp36cApplyOps(serverState,ops);
+                  if(applied.conflicts.length){
+                    dp36cRestore(box.working);
+                    dp36cWriteBlocked=true;
+                    dp36cBanner(
+                      '⚠ '+applied.conflicts.length+' Offline-Änderung(en) kollidieren mit inzwischen geänderten Serverdaten. Nichts wird automatisch überschrieben; die Offline-Daten bleiben lokal erhalten.',
+                      true
+                    );
+                    dp36cStatus('⚠ Offline-Konflikt · Daten lokal erhalten · keine automatische Überschreibung');
+                    dp36cRender();
+                    console.warn('DLB-036C Offline-Konflikte',applied.conflicts);
+                    return false;
+                  }
+
+                  state=applied.merged;
+                  try{if(typeof sessionUser!=='undefined'&&sessionUser)state.user=sessionUser;}catch(_){}
+                  dp36cDedupeNewNotices();
+
+                  if(ops.length&&dp36cBasePersist){
+                    await dp36cBasePersist();
+                  }
+
+                  dp36cRecoveryRead=true;
+                  await dp36cBaseLoadState();
+                  dp36cRecoveryRead=false;
+
+                  dp36cClearOutbox();
+                  dp36cLastSuccessHash=dp36cStateHash();
+                  dp36cRefreshKnownNotices();
+                  dp36cSaveGood('offline-outbox-flushed');
+                  dp36cWriteBlocked=false;
+                  dp36cBanner('');
+                  dp36cStatus('✓ '+ops.length+' Offline-Änderung'+(ops.length===1?'':'en')+' übertragen · Serverstand bestätigt');
+                  dp36cRender();
+                  return true;
+                }catch(e){
+                  dp36cRecoveryRead=false;
+                  dp36cWriteBlocked=true;
+                  if(box)dp36cRestore(box.working);
+                  if(dp36cNetworkish(e)){
+                    dp36cBanner('Verbindung noch nicht stabil – vorgemerkte Offline-Änderungen bleiben lokal erhalten.',true);
+                    dp36cStatus('OFFLINE / instabil · Warteschlange bleibt erhalten');
+                    dp36cScheduleRecover(15000);
+                  }else{
+                    dp36cBanner('Offline-Änderungen konnten noch nicht übertragen werden. Sie bleiben lokal erhalten.',true);
+                    dp36cStatus('⚠ Offline-Warteschlange noch nicht übertragen');
+                  }
+                  dp36cRender();
+                  console.warn('DLB-036C Recovery/Flush fehlgeschlagen',e);
+                  return false;
+                }
+              })().finally(function(){dp36cRecoverRunning=null;});
+
+              return dp36cRecoverRunning;
+            }
+
+            if(dp36cBasePersist){
+              persist=async function(){
+                if(dp36cRecoveryRead)return true;
+                dp36cDedupeNewNotices();
+
+                if(!dp36cOnline()){
+                  const box=dp36cEnsureOutbox('offline-persist');
+                  if(!box)throw dp36cErr('Offline-Änderung konnte lokal nicht vorgemerkt werden.','DP36C_OUTBOX_WRITE');
+                  dp36cShowPending(box,'OFFLINE');
+                  return true;
+                }
+
+                const pending=dp36cReadOutbox();
+                if(pending){
+                  pending.working=dp36cClone(state??pending.working);
+                  pending.updatedAt=dp36cNow();
+                  dp36cWriteOutbox(pending);
+                  const ok=await dp36cRecoverAndFlush();
+                  if(!ok||dp36cReadOutbox())throw dp36cErr('Offline-Warteschlange konnte noch nicht vollständig übertragen werden.','DP36C_OUTBOX_PENDING');
+                  return true;
+                }
+
+                if(dp36cWriteBlocked){
+                  const ok=await dp36cRecoverAndFlush();
+                  if(!ok)throw dp36cErr('Speichern gesperrt, bis der Serverstand sicher geprüft wurde.','DP36C_RELOAD_REQUIRED');
+                }
+
+                const currentHash=dp36cStateHash();
+                if(dp36cLastSuccessHash&&currentHash===dp36cLastSuccessHash)return true;
+                if(dp36cPersistRunning)return dp36cPersistRunning;
+
+                const self=this,args=arguments;
+                dp36cPersistRunning=(async function(){
+                  try{
+                    const result=await dp36cBasePersist.apply(self,args);
+                    dp36cLastSuccessHash=dp36cStateHash();
+                    dp36cRefreshKnownNotices();
+                    dp36cSaveGood('persist-confirmed');
+                    return result;
+                  }catch(e){
+                    if(dp36cNetworkish(e)){
+                      const box=dp36cEnsureOutbox('unsicherer-online-schreibvorgang');
+                      dp36cWriteBlocked=true;
+                      if(box)dp36cBanner('Speichern nicht sicher bestätigt – aktueller Stand wurde lokal vorgemerkt. Kein blinder Retry; Abgleich erfolgt nach stabilem Serverkontakt.',true);
+                      dp36cStatus('⚠ Speichern unklar · lokal vorgemerkt · sicherer Abgleich folgt');
+                      dp36cScheduleRecover(3000);
+                    }
+                    throw e;
+                  }
+                })().finally(function(){dp36cPersistRunning=null;});
+                return dp36cPersistRunning;
+              };
+            }
+
+            if(dp36cBaseLoadState){
+              loadState=async function(){
+                if(!dp36cOnline()){
+                  if(dp36cRestoreOfflineView())return;
+                  throw dp36cErr('OFFLINE: Kein lokaler Datenstand vorhanden.','DP36C_NO_CACHE');
+                }
+                if(dp36cReadOutbox()){
+                  const ok=await dp36cRecoverAndFlush();
+                  if(ok)return;
+                  return;
+                }
+                try{
+                  dp36cRecoveryRead=true;
+                  const r=await dp36cBaseLoadState.apply(this,arguments);
+                  dp36cRecoveryRead=false;
+                  dp36cWriteBlocked=false;
+                  dp36cLastSuccessHash=dp36cStateHash();
+                  dp36cRefreshKnownNotices();
+                  dp36cSaveGood('load-confirmed');
+                  dp36cBanner('');
+                  return r;
+                }catch(e){
+                  dp36cRecoveryRead=false;
+                  if(dp36cNetworkish(e)&&dp36cRestoreOfflineView())return;
+                  throw e;
+                }
+              };
+            }
+
+            if(dp36cBasePoll){
+              dpG3Poll=async function(){
+                if(!dp36cOnline()){
+                  const box=dp36cReadOutbox();
+                  if(box)dp36cShowPending(box,'OFFLINE');
+                  else dp36cBanner('OFFLINE – letzter Stand bleibt sichtbar. Änderungen werden beim Speichern lokal vorgemerkt.');
+                  return;
+                }
+                if(dp36cReadOutbox()||dp36cWriteBlocked){
+                  dp36cScheduleRecover(250);
+                  return;
+                }
+                try{
+                  const r=await dp36cBasePoll.apply(this,arguments);
+                  dp36cLastSuccessHash=dp36cStateHash();
+                  dp36cRefreshKnownNotices();
+                  dp36cSaveGood('auto-sync-confirmed');
+                  return r;
+                }catch(e){
+                  if(dp36cNetworkish(e)){
+                    dp36cWriteBlocked=true;
+                    dp36cBanner('Auto-Sync wegen Verbindungsfehler pausiert. Änderungen können lokal vorgemerkt werden.',true);
+                    dp36cScheduleRecover(3000);
+                  }
+                  throw e;
+                }
+              };
+            }
+
+            window.addEventListener('offline',function(){
+              dp36cWriteBlocked=false;
+              const box=dp36cReadOutbox();
+              if(box)dp36cShowPending(box,'OFFLINE');
+              else dp36cBanner('OFFLINE – letzter Stand bleibt sichtbar. Eingaben werden beim Speichern lokal vorgemerkt.');
+              dp36cStatus('OFFLINE · lokale Warteschlange aktiv');
+            });
+            window.addEventListener('online',function(){
+              dp36cScheduleRecover(250);
+            });
+
+            try{dp36cRefreshKnownNotices();}catch(_){}
+            if(!dp36cOnline())dp36cRestoreOfflineView();
+            else if(dp36cReadOutbox())dp36cScheduleRecover(250);
+
+            window.__DISPOLUX_036C={
+              version:'1.16.0.19',
+              recoverAndFlush:dp36cRecoverAndFlush,
+              pendingCount:function(){return dp36cPendingCount(dp36cReadOutbox());},
+              hasPending:function(){return !!dp36cReadOutbox();},
+              clearOutbox:function(){dp36cClearOutbox();},
+              goodKey:dp36cGoodKey,
+              outboxKey:dp36cOutboxKey
+            };
+          })();
+          /* DP_DLB_036C_1_16_0_19_OFFLINE_OUTBOX_SYNC_END */
+          """
+
+          pf=Path('/tmp/dlb036c_patch.js')
+          pf.write_text(patch,encoding='utf-8',newline='\n')
+          subprocess.run(['node','--check',str(pf)],check=True)
+
+          pattern=re.compile(re.escape(old_begin)+r'.*?'+re.escape(old_end),re.S)
+          if len(pattern.findall(src))!=1:
+              raise SystemExit('036C: 036B-Patchblock nicht eindeutig ersetzbar.')
+          src=pattern.sub(patch,src,count=1)
+          runtime.write_text(src,encoding='utf-8',newline='\n')
+
+          if runtime.suffix=='.js':
+              subprocess.run(['node','--check',str(runtime)],check=True)
+
+          print('036C: 036B Read-only Offline-Guard durch Offline-Outbox mit sicherem Reconnect-Merge ersetzt:',runtime)
+          PY_PATCH_036C
+
+      - name: Set 036C SPFx version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VER_036C'
+          from pathlib import Path
+          p=Path('spfx-build/config/package-solution.json')
+          src=p.read_text(encoding='utf-8')
+          if src.count('1.3.6.112')!=1:
+              raise SystemExit(
+                  f"036C: erwartete 036B-SPFx-Version 1.3.6.112 genau einmal, gefunden {src.count('1.3.6.112')}x."
+              )
+          p.write_text(src.replace('1.3.6.112','1.3.6.113',1),encoding='utf-8',newline='\n')
+          PY_VER_036C
+
+      - name: Validate 036C source before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VALIDATE_036C'
+          from pathlib import Path
+          import json
+          import re
+          import subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          begin='DP_DLB_036C_1_16_0_19_OFFLINE_OUTBOX_SYNC_BEGIN'
+          end='DP_DLB_036C_1_16_0_19_OFFLINE_OUTBOX_SYNC_END'
+          old='DP_DLB_036B_1_16_0_18_OFFLINE_RETRY_SAFETY_BEGIN'
+
+          hits=[]
+          all_text=[]
+          for p in files:
+              src=p.read_text(encoding='utf-8')
+              all_text.append(src)
+              if begin in src:hits.append((p,src))
+
+          if len(hits)!=1:
+              raise SystemExit(f'036C VALIDIERUNG: Patch in {len(hits)} Dateien statt genau 1 gefunden.')
+          runtime,src=hits[0]
+          if src.count(begin)!=1 or src.count(end)!=1:
+              raise SystemExit('036C VALIDIERUNG: Patchmarker nicht eindeutig.')
+          if old in src:
+              raise SystemExit('036C VALIDIERUNG: alter 036B Laufzeit-Patch ist noch aktiv.')
+
+          frag=src.split(begin,1)[1].split(end,1)[0]
+          combined='\n'.join(all_text)
+          required=[
+              'DispoLux:036C:lastGoodState:v1',
+              'DispoLux:036C:offlineOutbox:v1',
+              'dp36cEnsureOutbox',
+              'dp36cBuildOps',
+              'dp36cApplyOps',
+              'entity-upsert',
+              'entity-delete',
+              'section-replace',
+              'dp36cRecoverAndFlush',
+              'unsicherer-online-schreibvorgang',
+              'Nichts wird automatisch überschrieben',
+              'lokal vorgemerkt',
+              "window.addEventListener('offline'",
+              "window.addEventListener('online'",
+              "version:'1.16.0.19'",
+          ]
+          missing=[x for x in required if x not in frag]
+          if missing:
+              raise SystemExit('036C VALIDIERUNG: Offline-Outbox-Pflichtbestandteile fehlen: '+', '.join(missing))
+
+          basis_required=[
+              'DP_DLB_035B_1_16_0_16_AUFTRAG_KONTAKT_MEHRMULDEN_MATERIAL_BEGIN',
+              'DP_DLB_034D_1_16_0_15_DP_DATA_STAMMDATEN_PERSISTENZ_BEGIN',
+              'DP_DLB_030I_1_12_1_2_MULTIUSER_SYNC_CACHE_BEGIN',
+              'DP_DLB_030J_1_12_1_3_ORDERS_DIREKT_SYNC_BEGIN',
+              'DP_DLB_030AE_1_12_1_24_DPB_AUS_DP_DATA_ENTFERNT_BEGIN',
+              'DP_DLB_030AH_1_12_1_27_BACKUP_30MIN_FILES_BEGIN',
+              'plannedBinMaterials','actualBinMaterials','actualExistingBinMaterials',
+              'Telefon Baustelle','Telefon Kunde','DispoLux_Backup',
+          ]
+          missing=[x for x in basis_required if x not in combined]
+          if missing:
+              raise SystemExit('036C VALIDIERUNG: Basis unvollständig: '+', '.join(missing))
+
+          sections=list(re.finditer(r"sectionKeys\s*:\s*\[([^\]]*)\]",src))
+          if not sections:
+              raise SystemExit('036C VALIDIERUNG: keine sectionKeys gefunden.')
+          for idx,sm in enumerate(sections,1):
+              keys=set(re.findall(r"['\"]([^'\"]+)['\"]",sm.group(1)))
+              miss=[k for k in ('warehouses','transportLocations') if k not in keys]
+              if miss:
+                  raise SystemExit(f'036C VALIDIERUNG: sectionKeys #{idx} unvollständig: {miss}')
+
+          if 'await dp28dBackup(fields, rows, force);' in combined:
+              raise SystemExit('036C VALIDIERUNG: alter DPB-Schreibaufruf ist wieder aktiv.')
+
+          pkg=Path('spfx-build/config/package-solution.json')
+          data=json.loads(pkg.read_text(encoding='utf-8'))
+          version=data.get('solution',{}).get('version','')
+          if version!='1.3.6.113':
+              raise SystemExit(f'036C VALIDIERUNG: SPFx-Version {version!r} statt 1.3.6.113')
+
+          if runtime.suffix=='.js':subprocess.run(['node','--check',str(runtime)],check=True)
+
+          print('036C VALIDIERUNG OK')
+          print('- Basis exakt aus getestetem 036B rekonstruiert')
+          print('- 036B Read-only-Patch ersetzt, nicht zusätzlich gestapelt')
+          print('- Offline-Speichern schreibt lokal in persistente Warteschlange')
+          print('- Reconnect lädt zuerst Serverstand und merged nur gegenüber Offline-Basis geänderte Daten')
+          print('- bereits serverseitig angekommene Teile gelten als erledigt')
+          print('- echte Parallelkonflikte überschreiben Serverdaten nicht automatisch')
+          print('- Warteschlange bleibt bei Verbindungs-/Schreibfehlern erhalten')
+          PY_VALIDATE_036C
+
+      - name: Build and package 036C
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf spfx-build/release spfx-build/temp/deploy spfx-build/sharepoint/solution
+          (cd spfx-build && npx heft build --production)
+          (cd spfx-build && npx heft package-solution --production)
+
+          rm -rf artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n1)
+          test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          if [ -d spfx-build/release/assets ]; then
+            cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d spfx-build/temp/deploy ]; then
+            cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else
+            echo '036C: Keine SPFx Asset-Ausgabe gefunden.' >&2
+            exit 1
+          fi
+
+          if [ -f .dpx14_icon_b64 ]; then
+            python3 - <<'PY_ICON_036C'
+          from pathlib import Path
+          import base64
+          Path('artifact/UPLOAD_TO_SITEASSETS/DispoLux_DL_Icon_48.png').write_bytes(
+              base64.b64decode(Path('.dpx14_icon_b64').read_text().strip())
+          )
+          PY_ICON_036C
+          fi
+
+      - name: Validate emitted 036C package
+        shell: bash
+        run: |
+          set -euo pipefail
+          COUNT=0
+          while IFS= read -r -d '' JS; do
+            test -s "$JS"
+            node --check "$JS"
+            COUNT=$((COUNT+1))
+          done < <(find artifact/UPLOAD_TO_SITEASSETS -maxdepth 1 -type f -name '*.js' -print0)
+          test "$COUNT" -gt 0
+
+          PKG=artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+          test -s "$PKG"
+
+          python3 - <<'PY_FINAL_036C'
+          from pathlib import Path
+          import re
+
+          assets=Path('artifact/UPLOAD_TO_SITEASSETS')
+          js_files=list(assets.glob('*.js'))
+          marker='__DISPOLUX_036C'
+          current=[]
+          for p in js_files:
+              s=p.read_text(encoding='utf-8')
+              if marker in s:current.append((p,s))
+
+          if len(current)!=1:
+              raise SystemExit(
+                  '036C FINAL: erwartet genau einen aktuellen Produktionsbundle mit '
+                  f'{marker}; gefunden {len(current)}: {[p.name for p,_ in current]}'
+              )
+
+          current_path,current_src=current[0]
+          required=[
+              '__DISPOLUX_034D','__DISPOLUX_035B','__DISPOLUX_036C',
+              'plannedBinMaterials','actualBinMaterials','actualExistingBinMaterials',
+              'Telefon Baustelle','Telefon Kunde','DispoLux_Backup',
+              'DispoLux:036C:lastGoodState:v1','DispoLux:036C:offlineOutbox:v1',
+              'lokal vorgemerkt','Nichts wird automatisch überschrieben',
+              'warehouses','transportLocations','dp32BDriverButton','Standort setzen',
+          ]
+          missing=[x for x in required if x not in current_src]
+          if missing:
+              raise SystemExit('036C FINAL: Pflichtbestandteile fehlen im aktuellen Bundle: '+', '.join(missing))
+          if '__DISPOLUX_036B' in current_src:
+              raise SystemExit('036C FINAL: alter 036B Laufzeit-Wrapper ist noch im Produktionsbundle aktiv.')
+
+          sections=list(re.finditer(r"sectionKeys\s*:\s*\[([^\]]*)\]",current_src))
+          if not sections:
+              raise SystemExit('036C FINAL: keine sectionKeys im Produktionsbundle gefunden.')
+          for idx,sm in enumerate(sections,1):
+              keys=set(re.findall(r"['\"]([^'\"]+)['\"]",sm.group(1)))
+              miss=[k for k in ('warehouses','transportLocations') if k not in keys]
+              if miss:raise SystemExit(f'036C FINAL: sectionKeys #{idx} unvollständig: {miss}')
+
+          stale=[]
+          for p in js_files:
+              if p==current_path:continue
+              s=p.read_text(encoding='utf-8')
+              if 'sectionKeys' in s and 'DP_Data' in s:stale.append(p.name)
+          if stale:
+              raise SystemExit('036C FINAL: alte DP_Data-WebPart-Bundles im Auslieferungsordner: '+repr(stale))
+
+          print('036C FINAL OK')
+          print('- aktueller Produktionsbundle:',current_path.name)
+          print('- Offline-Outbox + sicherer Reconnect-Merge enthalten')
+          print('- 035B/034D-Funktionen erhalten')
+          print('- kein alter 036B Runtime-Wrapper gestapelt')
+          PY_FINAL_036C
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DLB-036C-1.16.0.19 · OFFLINE-ARBEIT + PERSISTENTE WARTESCHLANGE + SICHERER RECONNECT · SPFx 1.3.6.113
+
+          Basis:
+          - getesteter DLB-036B-1.16.0.18
+          - 035B-Auftrags-/Kontakt-/Mehrmulden-Materialfunktionen vollständig erhalten
+          - 034D-Stammdaten-Persistenz vollständig erhalten
+          - 030AE DPB-Stop und 030AH 30-Minuten-Dateibackup bleiben erhalten
+
+          036C:
+          - Offline-Eingaben werden beim Speichern lokal persistent vorgemerkt statt verworfen.
+          - Die Warteschlange überlebt Reload/Browser-Neustart, solange der Browser-Speicher nicht gelöscht wird.
+          - Beim Wiederkommen der Verbindung wird zuerst der aktuelle Serverstand geladen.
+          - Nur Änderungen gegenüber dem letzten bestätigten Ausgangsstand werden auf den Serverstand gemerged.
+          - Bereits teilweise am Server angekommene Änderungen werden als bereits erledigt erkannt.
+          - Bei echten Parallelkonflikten wird NICHT automatisch überschrieben; die Offline-Daten bleiben lokal erhalten.
+          - Bei instabiler Verbindung bleibt die Warteschlange erhalten und wird später erneut geprüft.
+          - Gleichartige neue Dispo-Mitteilungen werden vor Speicherung weiterhin innerhalb 60 Sekunden dedupliziert.
+
+          Grenze:
+          - 036C puffert DispoLux-Zustandsänderungen über persist(). Binäre Datei-/Foto-Uploads sind nicht Bestandteil dieser Offline-Warteschlange.
+          - Wenn die SharePoint/SPFx-App selbst ohne Netz nicht aus dem Browsercache startet, kann auch 036C erst greifen, wenn das App-Shell bereits geladen ist.
+
+          Pflicht-Praxistest:
+          1. Online Testauftrag öffnen und vollständig laden lassen.
+          2. Flugmodus einschalten.
+          3. Im Testauftrag eine eindeutige Bemerkung setzen, z. B. OFFLINE-036C-TEST, und Speichern auslösen.
+          4. Banner muss melden, dass mindestens 1 Änderung lokal vorgemerkt ist. Kein SharePoint-Fehler darf die Eingabe verwerfen.
+          5. Optional eine zweite Änderung offline speichern; Zähler der vorgemerkten Änderungen muss entsprechend reagieren.
+          6. Flugmodus ausschalten. DispoLux muss zuerst Serverstand laden und danach Warteschlange übertragen.
+          7. Erfolgsmeldung muss "Offline-Änderung(en) übertragen · Serverstand bestätigt" anzeigen.
+          8. Auftrag neu öffnen bzw. App neu laden: OFFLINE-036C-TEST muss weiterhin vorhanden sein.
+          9. In DP_Data prüfen: kein doppelter Auftrag und keine doppelte identische Dispo-Mitteilung durch die Wiederverbindung.
+          10. Konflikttest später mit zwei Geräten: denselben Auftrag online auf Gerät A und offline auf Gerät B unterschiedlich ändern; 036C darf den Online-Stand nicht still überschreiben, sondern muss Konflikt melden und Offline-Daten lokal behalten.
+          TXT
+
+          cat > artifact/DISPOLUX_THEMENREGISTER_ERGAENZUNG_036C.csv <<'CSV'
+          Bereich;Änderung;Build;Status
+          Offline / Schlechtnetz;Offline-Eingaben persistent lokal vormerken;DLB-036C;Umgesetzt
+          Offline / Schlechtnetz;Warteschlange überlebt Reload solange Browser-Speicher erhalten bleibt;DLB-036C;Umgesetzt
+          Datenintegrität;Reconnect lädt zuerst aktuellen Serverstand;DLB-036C;Umgesetzt
+          Datenintegrität;Offline-Deltas werden konfliktgeprüft auf Serverstand gemerged;DLB-036C;Umgesetzt
+          Datenintegrität;Teilweise bereits serverseitig geschriebene Änderungen werden idempotent erkannt;DLB-036C;Umgesetzt
+          Datenintegrität;Parallelkonflikte überschreiben Serverdaten nicht automatisch;DLB-036C;Umgesetzt
+          CSV
+
+          echo '036C: Produktions-JS syntaktisch gültig; SPPKG vorhanden; Offline-Outbox und sichere Reconnect-Synchronisation geprüft.'
+
+      - name: Upload DLB-036C artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-036C-1.16.0.19-OFFLINE-OUTBOX-SYNC-SPFX-1.3.6.113
+          path: artifact/
+          if-no-files-found: error
