@@ -1,0 +1,680 @@
+name: DLB-039B-1.16.0.29 RECOVERY DIRECT SAFETY BACKUP FULL BUILD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Rebuild exact tested DLB-036D basis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY_RUN_036D_BASE'
+          from pathlib import Path
+          import subprocess
+          import yaml
+
+          wf=Path('.github/workflows/DLB-036D-1.16.0.20_OFFLINE_OUTBOX_SYNC_FULL_BUILD.yml')
+          if not wf.exists():
+              raise SystemExit('039B: getesteter 036D-Workflow fehlt im Repository.')
+
+          doc=yaml.safe_load(wf.read_text(encoding='utf-8'))
+          runs=[(s.get('name',''),s.get('run')) for s in doc['jobs']['build']['steps'] if s.get('run')]
+          if len(runs)!=6:
+              raise SystemExit(f'039B: 036D-Basis erwartet 6 ausführbare Buildschritte, gefunden {len(runs)}.')
+
+          for idx,(name,script) in enumerate(runs,1):
+              print(f'===== 039B Basis 036D Schritt {idx}/{len(runs)}: {name} =====')
+              runner=Path(f'.039a_036d_step_{idx}.sh')
+              runner.write_text(script,encoding='utf-8',newline='\n')
+              try:
+                  subprocess.run(['bash','-euo','pipefail',str(runner)],check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+
+          print('039B: getesteter DLB-036D-Stand vollständig rekonstruiert.')
+          PY_RUN_036D_BASE
+
+      - name: Add one-shot recovery from confirmed pre-clean backup
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH_039B'
+          from pathlib import Path
+          import json
+          import subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          base_marker='DP_DLB_036D_1_16_0_20_OFFLINE_OUTBOX_SYNC_BEGIN'
+          end_marker='/* DP13_PATCH_END */'
+          new_marker='DP_DLB_039B_1_16_0_28_RECOVERY_PRE_CLEAN_BEGIN'
+
+          hits=[]
+          for p in files:
+              s=p.read_text(encoding='utf-8')
+              if base_marker in s and end_marker in s:
+                  hits.append((p,s))
+          if len(hits)!=1:
+              raise SystemExit(f'039B: 036D-App-Runtime {len(hits)}x statt genau 1x gefunden.')
+
+          runtime,src=hits[0]
+          if new_marker in src:
+              raise SystemExit('039B: Recovery-Patch bereits vorhanden.')
+          if src.count(end_marker)!=1:
+              raise SystemExit(f'039B: DP13-Endmarker {src.count(end_marker)}x statt 1x.')
+
+          patch=r"""
+          /* DP_DLB_039B_1_16_0_28_RECOVERY_PRE_CLEAN_BEGIN */
+          (function(){
+            'use strict';
+            if(window.__DISPOLUX_039B?.version==='1.16.0.29')return;
+
+            const dp39BackupLibrary='DispoLux_Backup';
+            const dp39BackupFile='DP_Data_2026-10-06T16-00-00Z.json';
+            const dp39ExpectedCapturedAt='2026-10-06T16:25:00.256Z';
+            const dp39ExpectedRows=615;
+            let dp39Running=false;
+
+            function dp39Text(v){return String(v??'').trim();}
+            function dp39Esc(v){return String(v??'').replace(/'/g,"''");}
+            function dp39Online(){return typeof navigator==='undefined'||navigator.onLine!==false;}
+            function dp39Role(){
+              return dp39Text(window.DP_AUTH?.role||state?.user?.role||'').toLocaleLowerCase('de-DE');
+            }
+            function dp39Admin(){
+              const r=dp39Role();
+              return r==='admin'||r==='administrator';
+            }
+            function dp39OutboxPending(){
+              try{return !!window.__DISPOLUX_036D?.hasPending?.();}catch(_){return false;}
+            }
+            function dp39WebUrl(){
+              try{
+                if(typeof SPStore!=='undefined'&&SPStore&&typeof SPStore.webUrl==='function')return dp39Text(SPStore.webUrl());
+              }catch(_){}
+              try{
+                const listApi=dp39Text(SPStore?.listApi?.());
+                const marker='/_api/web/lists/getbytitle(';
+                const pos=listApi.indexOf(marker);
+                if(pos>0)return listApi.slice(0,pos);
+              }catch(_){}
+              return dp39Text(window.DP_SHAREPOINT?.webUrl||'').replace(/\/$/,'');
+            }
+            function dp39Banner(message,bad=false){
+              let el=document.getElementById('dp39RecoveryBanner');
+              if(!el){
+                el=document.createElement('div');
+                el.id='dp39RecoveryBanner';
+                el.style.cssText='position:sticky;top:0;z-index:100000;padding:10px 12px;border-bottom:1px solid rgba(0,0,0,.2);font:700 13px Arial,sans-serif;text-align:center';
+                (document.body||document.documentElement).insertBefore(el,(document.body||document.documentElement).firstChild||null);
+              }
+              el.style.background=bad?'#ffd7d7':'#fff1b8';
+              el.style.color='#1f1f1f';
+              el.textContent=message||'';
+              el.style.display=message?'block':'none';
+            }
+            function dp39Status(message){
+              try{if(typeof dpG3Status==='function'){dpG3Status(message);return;}}catch(_){}
+              try{const el=document.getElementById('storageStatus');if(el)el.textContent=message;}catch(_){}
+            }
+            async function dp39Digest(){
+              const web=dp39WebUrl();
+              if(!web)throw new Error('SharePoint-Webadresse fehlt.');
+              const resp=await fetch(encodeURI(web+'/_api/contextinfo').replace(/#/g,'%23'),{
+                method:'POST',
+                credentials:'same-origin',
+                headers:{
+                  'Accept':'application/json;odata=nometadata',
+                  'Content-Type':'application/json;odata=nometadata'
+                }
+              });
+              const txt=await resp.text();
+              let data={};
+              if(txt){try{data=JSON.parse(txt);}catch(_){data={raw:txt};}}
+              if(!resp.ok){
+                throw new Error('SharePoint ContextInfo fehlgeschlagen: '+(data?.error?.message?.value||data?.error?.message||data?.raw||resp.statusText||resp.status));
+              }
+              const info=data?.d?.GetContextWebInformation||data?.GetContextWebInformation||data||{};
+              const digest=dp39Text(info.FormDigestValue||data?.FormDigestValue);
+              if(!digest)throw new Error('SharePoint-Anforderungstoken fehlt.');
+              return digest;
+            }
+            async function dp39DirectEmergencyBackup(){
+              if(typeof SPStore==='undefined'||!SPStore||typeof SPStore.loadItems!=='function'){
+                throw new Error('SPStore-Schnittstelle für Notfallsicherung fehlt.');
+              }
+              const web=dp39WebUrl();
+              if(!web)throw new Error('SharePoint-Webadresse fehlt.');
+
+              const current=await dp39CurrentRows();
+              const rows=[...current.values()]
+                .sort((a,b)=>a.title.localeCompare(b.title,'de'))
+                .map(r=>({Title:r.title,DP_Typ:r.type,DP_Daten:r.raw}));
+              if(!rows.length)throw new Error('Notfallsicherung abgebrochen: keine produktiven DP|-Zeilen gelesen.');
+
+              const capturedAt=new Date().toISOString();
+              const stamp=capturedAt.replace(/[:.]/g,'-');
+              const fileName='DP_Data_RECOVERY_SAFETY_'+stamp+'.json';
+              const payload={
+                format:'DispoLuxBackup',
+                formatVersion:1,
+                sourceList:'DP_Data',
+                capturedAt,
+                recordCount:rows.length,
+                recoverySafety:true,
+                build:'DLB-039B-1.16.0.29',
+                rows
+              };
+              const bytes=new TextEncoder().encode(JSON.stringify(payload));
+              const digest=await dp39Digest();
+              const uploadUrl=
+                web+"/_api/web/lists/getbytitle('"+dp39Esc(dp39BackupLibrary)+"')/RootFolder/Files/Add(url='"+
+                dp39Esc(fileName)+"',overwrite=false)";
+              const resp=await fetch(encodeURI(uploadUrl).replace(/#/g,'%23'),{
+                method:'POST',
+                credentials:'same-origin',
+                headers:{
+                  'Accept':'application/json;odata=nometadata',
+                  'Content-Type':'application/octet-stream',
+                  'X-RequestDigest':digest
+                },
+                body:bytes
+              });
+              const text=await resp.text();
+              let body={};
+              if(text){try{body=JSON.parse(text);}catch(_){body={raw:text};}}
+              if(!resp.ok){
+                throw new Error('Direkte Notfallsicherung fehlgeschlagen: '+(body?.error?.message?.value||body?.error?.message||body?.raw||resp.statusText||resp.status));
+              }
+
+              const listUrl=web+"/_api/web/lists/getbytitle('"+dp39Esc(dp39BackupLibrary)+"')/RootFolder/Files?$select=Name,Length&$top=5000";
+              const meta=await SPStore.request(listUrl,{
+                headers:{'Accept':'application/json;odata=nometadata','Cache-Control':'no-cache, no-store, max-age=0','Pragma':'no-cache','Expires':'0'},
+                cache:'no-store'
+              });
+              const files=Array.isArray(meta&&meta.value)?meta.value:(Array.isArray(meta&&meta.d&&meta.d.results)?meta.d.results:[]);
+              const saved=files.find(x=>dp39Text(x&&x.Name)===fileName);
+              if(!saved||Number(saved.Length||0)<=0){
+                throw new Error('Direkte Notfallsicherung wurde nach Upload nicht bestätigt.');
+              }
+              try{window.__DISPOLUX_039B_LAST_SAFETY_BACKUP={file:fileName,capturedAt,rows:rows.length,length:Number(saved.Length||0)};}catch(_){}
+              return fileName;
+            }
+            async function dp39FreshEmergencyBackup(){
+              dp39Status('Recovery: aktuellen Ist-Stand direkt sichern …');
+              const fileName=await dp39DirectEmergencyBackup();
+              dp39Status('Recovery: Ist-Stand gesichert · '+fileName);
+              return fileName;
+            }
+            async function dp39LoadBackup(){
+              if(typeof SPStore==='undefined'||!SPStore||typeof SPStore.request!=='function'){
+                throw new Error('SPStore-Schnittstelle fehlt.');
+              }
+              const web=dp39WebUrl();
+              if(!web)throw new Error('SharePoint-Webadresse fehlt.');
+
+              const listUrl=web+"/_api/web/lists/getbytitle('"+dp39Esc(dp39BackupLibrary)+"')/RootFolder/Files?$select=Name,TimeCreated,TimeLastModified,Length,ServerRelativeUrl&$top=5000";
+              const meta=await SPStore.request(listUrl,{
+                headers:{'Accept':'application/json;odata=nometadata','Cache-Control':'no-cache, no-store, max-age=0','Pragma':'no-cache','Expires':'0'},
+                cache:'no-store'
+              });
+              const files=Array.isArray(meta&&meta.value)?meta.value:(Array.isArray(meta&&meta.d&&meta.d.results)?meta.d.results:[]);
+              const file=files.find(x=>dp39Text(x&&x.Name)===dp39BackupFile);
+              if(!file)throw new Error('Bestätigte Sicherungsdatei fehlt: '+dp39BackupFile);
+              if(Number(file.Length||0)<=0)throw new Error('Sicherungsdatei ist leer.');
+
+              const rel=dp39Text(file.ServerRelativeUrl);
+              if(!rel)throw new Error('ServerRelativeUrl der Sicherung fehlt.');
+              const raw=await SPStore.request(
+                web+"/_api/web/GetFileByServerRelativeUrl('"+dp39Esc(rel)+"')/$value",
+                {headers:{'Accept':'application/json','Cache-Control':'no-cache, no-store, max-age=0','Pragma':'no-cache','Expires':'0'},cache:'no-store'}
+              );
+              const data=(typeof raw==='string')?JSON.parse(raw):raw;
+
+              if(!data||data.format!=='DispoLuxBackup'||Number(data.formatVersion)!==1)throw new Error('Sicherungsformat ist ungültig.');
+              if(dp39Text(data.sourceList)!=='DP_Data')throw new Error('Sicherung stammt nicht aus DP_Data.');
+              if(dp39Text(data.capturedAt)!==dp39ExpectedCapturedAt){
+                throw new Error('Falscher Sicherungszeitpunkt: '+dp39Text(data.capturedAt)+' statt '+dp39ExpectedCapturedAt);
+              }
+              if(!Array.isArray(data.rows)||data.rows.length!==dp39ExpectedRows||Number(data.recordCount)!==dp39ExpectedRows){
+                throw new Error('Falsche Datensatzanzahl im Backup: '+String(data.rows&&data.rows.length)+' statt '+dp39ExpectedRows);
+              }
+
+              const byTitle=new Map();
+              for(const row of data.rows){
+                const title=dp39Text(row&&row.Title);
+                const type=dp39Text(row&&row.DP_Typ);
+                const rawData=String((row&&row.DP_Daten)??'');
+                if(!title.startsWith('DP|'))throw new Error('Ungültiger Backup-Titel: '+title);
+                if(byTitle.has(title))throw new Error('Doppelter Titel im Backup: '+title);
+                try{JSON.parse(rawData);}catch(_){throw new Error('Ungültiges DP_Daten-JSON: '+title);}
+                byTitle.set(title,{title,type,raw:rawData});
+              }
+
+              for(const must of ['DP|archiveOrders','DP|warehouses','DP|transportLocations','DP|vehicles']){
+                if(!byTitle.has(must))throw new Error('Pflichtdatensatz fehlt im Backup: '+must);
+              }
+              return {data,byTitle};
+            }
+            async function dp39CurrentRows(){
+              if(typeof SPStore.loadItems!=='function')throw new Error('SPStore.loadItems fehlt.');
+              const rows=await SPStore.loadItems();
+              const current=new Map();
+              for(const row of rows||[]){
+                const title=dp39Text(row&&row.Title);
+                if(!title.startsWith('DP|'))continue;
+                current.set(title,{
+                  id:Number(row.Id||row.ID||0),
+                  title,
+                  type:dp39Text(row[SPStore.fields.type]||''),
+                  raw:String(row[SPStore.fields.data]??'')
+                });
+              }
+              return current;
+            }
+            async function dp39Chunks(items,fn,size=5){
+              let done=0;
+              for(let i=0;i<items.length;i+=size){
+                if(!dp39Online())throw new Error('Verbindung während Wiederherstellung verloren.');
+                const part=items.slice(i,i+size);
+                await Promise.all(part.map(fn));
+                done+=part.length;
+                dp39Status('Recovery '+done+'/'+items.length+' …');
+              }
+            }
+            async function dp39Verify(backup){
+              const current=await dp39CurrentRows();
+              if(current.size!==backup.byTitle.size){
+                throw new Error('Verifikation: '+current.size+' DP|-Zeilen statt '+backup.byTitle.size);
+              }
+              for(const [title,want] of backup.byTitle){
+                const got=current.get(title);
+                if(!got)throw new Error('Verifikation: Datensatz fehlt: '+title);
+                if(got.type!==want.type||got.raw!==want.raw){
+                  throw new Error('Verifikation: Inhalt weicht ab: '+title);
+                }
+              }
+              return true;
+            }
+            async function dp39Restore(){
+              if(dp39Running)return;
+              if(!dp39Admin()){alert('Recovery ist nur als Admin möglich.');return;}
+              if(!dp39Online()){alert('Recovery benötigt eine stabile Online-Verbindung.');return;}
+              if(dp39OutboxPending()){alert('Recovery gestoppt: Offline-Warteschlange ist noch nicht leer.');return;}
+
+              const ok=confirm(
+                'DispoLux RECOVERY\\n\\n'+
+                'Wiederhergestellt wird exakt der produktive DP_Data-Stand aus:\\n'+
+                dp39BackupFile+'\\n'+
+                'Sicherungszeit: 06.10.2026 18:25 Uhr\\n'+
+                'Produktive DP|-Datensätze: '+dp39ExpectedRows+'\\n\\n'+
+                'Vorher wird der JETZIGE Stand automatisch nochmals gesichert.\\n'+
+                'Danach werden die produktiven DP|-Zeilen exakt auf den Sicherungsstand gesetzt.\\n\\n'+
+                'Jetzt wiederherstellen?'
+              );
+              if(!ok)return;
+
+              dp39Running=true;
+              try{
+                dp39Banner('RECOVERY läuft – DispoLux nicht schließen und keine Aufträge bearbeiten.');
+                await dp39FreshEmergencyBackup();
+
+                dp39Status('Recovery: bestätigte Sicherung wird geprüft …');
+                const backup=await dp39LoadBackup();
+
+                if(typeof SPStore.ensureFields==='function')await SPStore.ensureFields();
+                const current=await dp39CurrentRows();
+
+                const extras=[...current.values()].filter(x=>!backup.byTitle.has(x.title));
+                const wanted=[...backup.byTitle.values()];
+
+                if(extras.length){
+                  dp39Status('Recovery: '+extras.length+' neuere DP|-Zeilen entfernen …');
+                  await dp39Chunks(extras,async row=>{
+                    const live=SPStore.remote?.get(row.title)||row;
+                    await SPStore.remove(live);
+                  },5);
+                }
+
+                dp39Status('Recovery: '+wanted.length+' gesicherte DP|-Zeilen zurückschreiben …');
+                await dp39Chunks(wanted,async rec=>{
+                  let live=SPStore.remote?.get(rec.title);
+                  if(live){
+                    if(dp39Text(live.type)!==rec.type||String(live.raw??'')!==rec.raw){
+                      await SPStore.update(live,rec);
+                    }
+                  }else{
+                    try{
+                      await SPStore.create(rec);
+                    }catch(e){
+                      const msg=dp39Text(e&&e.message||e);
+                      const status=Number(e&&((e.status!==undefined)?e.status:e.statusCode)||0);
+                      if(status!==409&&!/duplicate|SPDuplicateValuesFoundException|bereits vorhanden/i.test(msg))throw e;
+                      await SPStore.loadItems();
+                      live=SPStore.remote?.get(rec.title);
+                      if(!live)throw e;
+                      if(dp39Text(live.type)!==rec.type||String(live.raw??'')!==rec.raw){
+                        await SPStore.update(live,rec);
+                      }
+                    }
+                  }
+                },5);
+
+                dp39Status('Recovery: vollständige Nachprüfung …');
+                await dp39Verify(backup);
+
+                try{localStorage.setItem('DispoLux:039B:recovered',JSON.stringify({at:new Date().toISOString(),file:dp39BackupFile,rows:dp39ExpectedRows}));}catch(_){}
+                dp39Banner('RECOVERY ERFOLGREICH – '+dp39ExpectedRows+' produktive DP|-Datensätze exakt wiederhergestellt.');
+                dp39Status('✓ Recovery erfolgreich · '+dp39ExpectedRows+' DP|-Datensätze');
+                alert(
+                  'Wiederherstellung erfolgreich.\\n\\n'+
+                  dp39ExpectedRows+' produktive DP|-Datensätze stimmen exakt mit der Sicherung vom 06.10.2026 18:25 Uhr überein.\\n\\n'+
+                  'DispoLux wird jetzt neu geladen.'
+                );
+                location.reload();
+              }catch(e){
+                console.error('DLB-039B Recovery',e);
+                dp39Banner('RECOVERY ABGEBROCHEN – '+dp39Text(e&&e.message||e),true);
+                dp39Status('⚠ Recovery abgebrochen');
+                alert('Recovery abgebrochen.\\n\\n'+dp39Text(e&&e.message||e)+'\\n\\nDer vor Beginn erstellte Ist-Backup bleibt erhalten.');
+              }finally{
+                dp39Running=false;
+              }
+            }
+            function dp39InstallUi(){
+              if(!dp39Admin()||document.getElementById('dp39RecoveryControl'))return;
+              const box=document.createElement('div');
+              box.id='dp39RecoveryControl';
+              box.style.cssText='position:fixed;right:10px;bottom:10px;z-index:99999;background:#fff7d6;border:2px solid #a66b00;border-radius:10px;padding:9px;box-shadow:0 3px 14px rgba(0,0,0,.25);max-width:300px;font:12px Arial,sans-serif';
+              box.innerHTML=
+                '<div style="font-weight:700;margin-bottom:6px">Notfall-Recovery 039B</div>'+
+                '<div style="margin-bottom:7px">Bestätigter Stand: 06.10.2026 · 18:25 · 615 DP|-Datensätze</div>'+
+                '<button id="dp39RecoveryBtn" type="button" style="font:700 12px Arial;padding:7px 9px;border-radius:7px;border:1px solid #8b5b00;background:#ffd66b">Datenstand wiederherstellen</button>';
+              (document.body||document.documentElement).appendChild(box);
+              document.getElementById('dp39RecoveryBtn')?.addEventListener('click',dp39Restore);
+            }
+
+            window.__DISPOLUX_039B={
+              version:'1.16.0.29',
+              backupFile:dp39BackupFile,
+              expectedCapturedAt:dp39ExpectedCapturedAt,
+              expectedRows:dp39ExpectedRows,
+              restore:dp39Restore
+            };
+            window.dpDispoLuxRestorePreClean=dp39Restore;
+
+            if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>setTimeout(dp39InstallUi,1000),{once:true});
+            else setTimeout(dp39InstallUi,1000);
+            setTimeout(dp39InstallUi,4000);
+          })();
+          /* DP_DLB_039B_1_16_0_28_RECOVERY_PRE_CLEAN_END */
+          """
+
+          src=src.replace(end_marker,patch+'\n\n'+end_marker,1)
+          runtime.write_text(src,encoding='utf-8',newline='\n')
+          if runtime.suffix=='.js':
+              subprocess.run(['node','--check',str(runtime)],check=True)
+
+          pkg=Path('spfx-build/config/package-solution.json')
+          data=json.loads(pkg.read_text(encoding='utf-8'))
+          if data.get('solution',{}).get('version')!='1.3.6.114':
+              raise SystemExit('039B: erwartete 036D-SPFx-Version 1.3.6.114 fehlt.')
+          data['solution']['version']='1.3.6.123'
+          pkg.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+
+          print('039B: Recovery-Tool auf sauberer 036D-Basis eingebaut.')
+          PY_PATCH_039B
+
+      - name: Validate 039B source before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VALIDATE_039B'
+          from pathlib import Path
+          import json,re,subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          begin='DP_DLB_039B_1_16_0_28_RECOVERY_PRE_CLEAN_BEGIN'
+          end='DP_DLB_039B_1_16_0_28_RECOVERY_PRE_CLEAN_END'
+          hits=[]; combined=[]
+          for p in files:
+              s=p.read_text(encoding='utf-8')
+              combined.append(s)
+              if begin in s:hits.append((p,s))
+          if len(hits)!=1:
+              raise SystemExit(f'039B VALIDIERUNG: Recovery-Patch {len(hits)}x statt genau 1x gefunden.')
+
+          runtime,src=hits[0]
+          if src.count(begin)!=1 or src.count(end)!=1:
+              raise SystemExit('039B VALIDIERUNG: Patchmarker nicht eindeutig.')
+          frag=src.split(begin,1)[1].split(end,1)[0]
+          all_text='\n'.join(combined)
+
+          required=[
+              "version:'1.16.0.29'",
+              "DP_Data_2026-10-06T16-00-00Z.json",
+              "2026-10-06T16:25:00.256Z",
+              "const dp39ExpectedRows=615",
+              "dp39FreshEmergencyBackup",
+              "dp39DirectEmergencyBackup",
+              "DP_Data_RECOVERY_SAFETY_",
+              "/_api/contextinfo",
+              "RootFolder/Files/Add",
+              "TextEncoder",
+              "dp39LoadBackup",
+              "data.format!=='DispoLuxBackup'",
+              "data.sourceList)!=='DP_Data'",
+              "dp39CurrentRows",
+              "SPStore.remove",
+              "SPStore.update",
+              "SPStore.create",
+              "dp39Verify",
+              "Wiederherstellung erfolgreich",
+              "window.dpDispoLuxRestorePreClean",
+          ]
+          missing=[x for x in required if x not in frag]
+          if missing:
+              raise SystemExit('039B VALIDIERUNG: Pflichtbestandteile fehlen: '+', '.join(missing))
+
+          basis=[
+              'DP_DLB_036D_1_16_0_20_OFFLINE_OUTBOX_SYNC_BEGIN',
+              'DP_DLB_035B_1_16_0_16_AUFTRAG_KONTAKT_MEHRMULDEN_MATERIAL_BEGIN',
+              'DP_DLB_034D_1_16_0_15_DP_DATA_STAMMDATEN_PERSISTENZ_BEGIN',
+              'DP_DLB_030AH_1_12_1_27_BACKUP_30MIN_FILES_BEGIN',
+              'DispoLux:036D:offlineOutbox:v1',
+              'DispoLux_Backup',
+              'warehouses','transportLocations','plannedBinMaterials','actualBinMaterials',
+          ]
+          missing=[x for x in basis if x not in all_text]
+          if missing:
+              raise SystemExit('039B VALIDIERUNG: 036D-Basis unvollständig: '+', '.join(missing))
+
+          # Kein 037-Cleaner darf in diesem Recovery-Build aktiv sein.
+          for forbidden in [
+              'DP_DLB_037A_1_16_0_21_DP_DATA_HYGIENE_BEGIN',
+              'DP_DLB_037C_1_16_0_23_DP_DATA_HYGIENE_BEGIN',
+              'DP_DLB_037D_1_16_0_24_DP_DATA_HYGIENE_BACKUP_READY_BEGIN',
+              'DP_DLB_037E_1_16_0_25_DP_DATA_HYGIENE_BACKUP_FILE_CONFIRM_BEGIN',
+              'DP_DLB_037F_1_16_0_26_ORDERS_MERGE_GUARD_BEGIN',
+          ]:
+              if forbidden in all_text:
+                  raise SystemExit('039B VALIDIERUNG: unerlaubter 037-Cleaner enthalten: '+forbidden)
+
+          pkg=json.loads(Path('spfx-build/config/package-solution.json').read_text(encoding='utf-8'))
+          if pkg.get('solution',{}).get('version')!='1.3.6.123':
+              raise SystemExit('039B VALIDIERUNG: SPFx-Version ist nicht 1.3.6.123.')
+
+          if runtime.suffix=='.js':
+              subprocess.run(['node','--check',str(runtime)],check=True)
+
+          print('039B VALIDIERUNG OK')
+          print('- Basis exakt DLB-036D')
+          print('- kein 037-Cleaner enthalten')
+          print('- Recovery exakt aus DP_Data_2026-10-06T16-00-00Z.json')
+          print('- Sicherung bestätigt: capturedAt 2026-10-06T16:25:00.256Z / 615 produktive DP|-Zeilen')
+          print('- aktueller Ist-Stand wird vor Restore erneut gesichert')
+          print('- Restore wird vollständig nachverifiziert')
+          PY_VALIDATE_039B
+
+      - name: Build and package 039B
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf spfx-build/release spfx-build/temp/deploy spfx-build/sharepoint/solution
+          (cd spfx-build && npx heft build --production)
+          (cd spfx-build && npx heft package-solution --production)
+
+          rm -rf artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n1)
+          test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          if [ -d spfx-build/release/assets ]; then
+            cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d spfx-build/temp/deploy ]; then
+            cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else
+            echo '039B: Keine SPFx Asset-Ausgabe gefunden.' >&2
+            exit 1
+          fi
+
+          if [ -f .dpx14_icon_b64 ]; then
+            python3 - <<'PY_ICON_039B'
+          from pathlib import Path
+          import base64
+          Path('artifact/UPLOAD_TO_SITEASSETS/DispoLux_DL_Icon_48.png').write_bytes(
+              base64.b64decode(Path('.dpx14_icon_b64').read_text().strip())
+          )
+          PY_ICON_039B
+          fi
+
+      - name: Validate emitted 039B package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COUNT=0
+          while IFS= read -r -d '' JS; do
+            test -s "$JS"
+            node --check "$JS"
+            COUNT=$((COUNT+1))
+          done < <(find artifact/UPLOAD_TO_SITEASSETS -maxdepth 1 -type f -name '*.js' -print0)
+          test "$COUNT" -gt 0
+          test -s artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          python3 - <<'PY_FINAL_039B'
+          from pathlib import Path
+          import re
+
+          assets=Path('artifact/UPLOAD_TO_SITEASSETS')
+          js=list(assets.glob('*.js'))
+          current=[]
+          for p in js:
+              s=p.read_text(encoding='utf-8')
+              if '__DISPOLUX_039B' in s:
+                  current.append((p,s))
+          if len(current)!=1:
+              raise SystemExit(f'039B FINAL: aktueller Produktionsbundle {len(current)}x statt 1x gefunden.')
+
+          p,s=current[0]
+          required=[
+              '__DISPOLUX_036D',
+              '__DISPOLUX_039B',
+              'DP_Data_2026-10-06T16-00-00Z.json',
+              '2026-10-06T16:25:00.256Z',
+              '615',
+              'dpDispoLuxRestorePreClean',
+              'DispoLux_Backup',
+              'warehouses',
+              'transportLocations',
+              'plannedBinMaterials',
+              'actualBinMaterials',
+          ]
+          missing=[x for x in required if x not in s]
+          if missing:
+              raise SystemExit('039B FINAL: Pflichtbestandteile fehlen: '+', '.join(missing))
+
+          for forbidden in ['__DISPOLUX_037A','__DISPOLUX_037C','__DISPOLUX_037D','__DISPOLUX_037E','__DISPOLUX_037F']:
+              if forbidden in s:
+                  raise SystemExit('039B FINAL: unerlaubter Cleaner-Marker im Bundle: '+forbidden)
+
+          sections=list(re.finditer(r"sectionKeys\s*:\s*\[([^\]]*)\]",s))
+          if not sections:
+              raise SystemExit('039B FINAL: keine sectionKeys gefunden.')
+          for idx,m in enumerate(sections,1):
+              keys=set(re.findall(r"['\"]([^'\"]+)['\"]",m.group(1)))
+              miss=[k for k in ('warehouses','transportLocations') if k not in keys]
+              if miss:
+                  raise SystemExit(f'039B FINAL: sectionKeys #{idx} unvollständig: {miss}')
+
+          print('039B FINAL OK')
+          print('- sauberer DLB-036D-Unterbau')
+          print('- 037-Datenhygiene nicht enthalten')
+          print('- bestätigter Recovery-Stand: 06.10.2026 18:25 / 615 DP|-Zeilen')
+          print('- direkte, eigenständige Notfallsicherung vor Restore')
+          print('- vollständige Nachprüfung nach Restore')
+          PY_FINAL_039B
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DLB-039B-1.16.0.29 · RECOVERY VOR 037-DATENHYGIENE · SPFx 1.3.6.123
+
+          Zweck:
+          - einmalige, kontrollierte Wiederherstellung des produktiven DP_Data-Standes unmittelbar vor der fehlerhaften 037-Datenhygiene
+          - Grundlage ist bewusst DLB-036D; kein 037A–037F-Cleaner ist enthalten
+
+          Bestätigte Sicherung:
+          - Datei: DP_Data_2026-10-06T16-00-00Z.json
+          - capturedAt: 2026-10-06T16:25:00.256Z = 06.10.2026 18:25 Uhr MESZ
+          - 615 produktive DP|-Datensätze
+          - Backupformat DispoLuxBackup Version 1
+
+          Ablauf:
+          1. Build installieren.
+          2. DispoLux als Admin online öffnen.
+          3. Unten rechts erscheint „Notfall-Recovery 039B“.
+          4. „Datenstand wiederherstellen“ drücken.
+          5. Vor der Änderung wird der aktuelle Ist-Stand durch 039B direkt als eigene JSON-Datei in DispoLux_Backup gesichert; dafür ist keine alte Backup-Funktion nötig.
+          6. Danach werden ausschließlich die produktiven DP|-Zeilen exakt auf den bestätigten Backupstand gesetzt.
+          7. DPB|-Altbackups werden NICHT wieder in DP_Data zurückgeschrieben.
+          8. Nach dem Schreiben wird jede DP|-Zeile gegen das Backup nachgeprüft.
+          9. Nur bei exakter Übereinstimmung meldet DispoLux „Recovery erfolgreich“ und lädt neu.
+
+          Erwarteter Zustand danach:
+          - 615 produktive DP|-Datensätze aus der Sicherung
+          - alte Auftragszeilen, die der 037-Cleaner entfernt hatte, sind wieder vorhanden
+          - archiveOrders bleibt ebenfalls auf exakt demselben Sicherungsstand
+          - kein 037-Housekeeping läuft
+
+          Danach:
+          - Planung/Aufträge mit Datum vor/zurück prüfen.
+          - Erst nach bestätigter Funktion wird ein neuer, nicht-destruktiver Cleaner gebaut.
+          TXT
+
+          echo '039B: Recovery-Build syntaktisch und strukturell geprüft.'
+
+      - name: Upload DLB-039B artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-039B-1.16.0.29-RECOVERY-DIRECT-SAFETY-BACKUP-SPFX-1.3.6.123
+          path: artifact/
+          if-no-files-found: error
