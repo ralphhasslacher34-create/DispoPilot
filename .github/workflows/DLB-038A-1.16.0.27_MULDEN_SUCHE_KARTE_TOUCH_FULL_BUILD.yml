@@ -1,0 +1,393 @@
+name: DLB-038A-1.16.0.27 MULDEN SUCHE KARTE TOUCH FULL BUILD
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/DLB-038A-1.16.0.27_MULDEN_SUCHE_KARTE_TOUCH_FULL_BUILD.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Rebuild exact successful DLB-037E basis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY_RUN_037E_BASE'
+          from pathlib import Path
+          import subprocess
+          import yaml
+
+          wf=Path('.github/workflows/DLB-037E-1.16.0.25_DP_DATA_HYGIENE_BACKUP_FILE_CONFIRM_FULL_BUILD.yml')
+          if not wf.exists():
+              raise SystemExit('038A: erfolgreicher 037E-Workflow fehlt im Repository.')
+
+          doc=yaml.safe_load(wf.read_text(encoding='utf-8'))
+          runs=[(s.get('name',''),s.get('run')) for s in doc['jobs']['build']['steps'] if s.get('run')]
+          if len(runs)!=5:
+              raise SystemExit(f'038A: 037E erwartet 5 ausführbare Schritte, gefunden {len(runs)}.')
+
+          # Nur den geprüften 037E-Quellstand rekonstruieren.
+          for idx,(name,script) in enumerate(runs[:3],1):
+              print(f'===== 038A Basis 037E Schritt {idx}/3: {name} =====')
+              runner=Path(f'.038a_037e_step_{idx}.sh')
+              runner.write_text(script,encoding='utf-8',newline='\n')
+              try:
+                  subprocess.run(['bash','-euo','pipefail',str(runner)],check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+
+          print('038A: erfolgreicher DLB-037E-Quellstand vollständig rekonstruiert.')
+          PY_RUN_037E_BASE
+
+      - name: Apply DLB-038A integrated touch map
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH_038A'
+          from pathlib import Path
+          import base64,json,subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+
+          required_markers=[
+              'DP_DLB_037E_1_16_0_25_DP_DATA_HYGIENE_BACKUP_FILE_CONFIRM_BEGIN',
+              'DP_DLB_036D_1_16_0_20_OFFLINE_OUTBOX_SYNC_BEGIN',
+              'DP_DLB_031G_1_16_0_6_STANDORTE_NAVIGATION_BEGIN',
+              '/* DP13_PATCH_END */',
+          ]
+
+          candidates=[]
+          for p in files:
+              s=p.read_text(encoding='utf-8')
+              if all(x in s for x in required_markers):
+                  candidates.append((p,s))
+          if len(candidates)!=1:
+              raise SystemExit('038A: erwartete genau eine vollständige 037E-App-Runtime, gefunden: '+repr([str(p) for p,_ in candidates]))
+
+          runtime,src=candidates[0]
+          if 'DP_DLB_038A_1_16_0_27_MULDEN_SUCHE_KARTE_BEGIN' in src:
+              raise SystemExit('038A: Patch bereits vorhanden.')
+
+          render_block=base64.b64decode('Y29uc3QgZHAzOEFNYXBTdGF0ZT17CiAgICB6b29tOjE2LAogICAgY2VudGVyWDpudWxsLAogICAgY2VudGVyWTpudWxsLAogICAgc2lnbmF0dXJlOicnLAogICAgdXNlck1vdmVkOmZhbHNlLAogICAgcG9pbnRlcnM6bmV3IE1hcCgpLAogICAgZ2VzdHVyZTpudWxsCiAgfTsKCiAgZnVuY3Rpb24gZHAzOEFSZXNldFZpZXcoKXsKICAgIGRwMzhBTWFwU3RhdGUuY2VudGVyWD1udWxsOwogICAgZHAzOEFNYXBTdGF0ZS5jZW50ZXJZPW51bGw7CiAgICBkcDM4QU1hcFN0YXRlLnNpZ25hdHVyZT0nJzsKICAgIGRwMzhBTWFwU3RhdGUudXNlck1vdmVkPWZhbHNlOwogICAgZHAzOEFNYXBTdGF0ZS5wb2ludGVycy5jbGVhcigpOwogICAgZHAzOEFNYXBTdGF0ZS5nZXN0dXJlPW51bGw7CiAgfQoKICBmdW5jdGlvbiBkcDM4QVdvcmxkU2l6ZSh6b29tKXsKICAgIHJldHVybiBNYXRoLnBvdygyLHpvb20pKjI1NjsKICB9CgogIGZ1bmN0aW9uIGRwMzhBQ2xhbXBWaWV3KCl7CiAgICBjb25zdCBzaXplPWRwMzhBV29ybGRTaXplKGRwMzhBTWFwU3RhdGUuem9vbSk7CiAgICBpZighTnVtYmVyLmlzRmluaXRlKGRwMzhBTWFwU3RhdGUuY2VudGVyWCkpZHAzOEFNYXBTdGF0ZS5jZW50ZXJYPXNpemUvMjsKICAgIGlmKCFOdW1iZXIuaXNGaW5pdGUoZHAzOEFNYXBTdGF0ZS5jZW50ZXJZKSlkcDM4QU1hcFN0YXRlLmNlbnRlclk9c2l6ZS8yOwogICAgZHAzOEFNYXBTdGF0ZS5jZW50ZXJYPSgoZHAzOEFNYXBTdGF0ZS5jZW50ZXJYJXNpemUpK3NpemUpJXNpemU7CiAgICBkcDM4QU1hcFN0YXRlLmNlbnRlclk9TWF0aC5tYXgoMCxNYXRoLm1pbihzaXplLGRwMzhBTWFwU3RhdGUuY2VudGVyWSkpOwogIH0KCiAgZnVuY3Rpb24gZHAzOEFGaXQoY3VycmVudCx3aWR0aCxoZWlnaHQsc2lnbmF0dXJlKXsKICAgIGxldCB6b29tPTE3LHB0cz1bXTsKICAgIGZvcihsZXQgej0xODt6Pj0zO3otLSl7CiAgICAgIGNvbnN0IHRlc3Q9Y3VycmVudC5tYXAoYj0+KHsuLi5kcDMxR1dvcmxkUG9pbnQoYi5ncHNMYXQsYi5ncHNMb24seiksYn0pKTsKICAgICAgY29uc3QgeHM9dGVzdC5tYXAocD0+cC54KSx5cz10ZXN0Lm1hcChwPT5wLnkpOwogICAgICBpZihNYXRoLm1heCguLi54cyktTWF0aC5taW4oLi4ueHMpPD1NYXRoLm1heCg4MCx3aWR0aC03MCkmJgogICAgICAgICBNYXRoLm1heCguLi55cyktTWF0aC5taW4oLi4ueXMpPD1NYXRoLm1heCg4MCxoZWlnaHQtOTApKXsKICAgICAgICB6b29tPXo7cHRzPXRlc3Q7YnJlYWs7CiAgICAgIH0KICAgIH0KICAgIGlmKCFwdHMubGVuZ3RoKXB0cz1jdXJyZW50Lm1hcChiPT4oey4uLmRwMzFHV29ybGRQb2ludChiLmdwc0xhdCxiLmdwc0xvbix6b29tKSxifSkpOwogICAgY29uc3QgeHM9cHRzLm1hcChwPT5wLngpLHlzPXB0cy5tYXAocD0+cC55KTsKICAgIGRwMzhBTWFwU3RhdGUuem9vbT16b29tOwogICAgZHAzOEFNYXBTdGF0ZS5jZW50ZXJYPShNYXRoLm1pbiguLi54cykrTWF0aC5tYXgoLi4ueHMpKS8yOwogICAgZHAzOEFNYXBTdGF0ZS5jZW50ZXJZPShNYXRoLm1pbiguLi55cykrTWF0aC5tYXgoLi4ueXMpKS8yOwogICAgZHAzOEFNYXBTdGF0ZS5zaWduYXR1cmU9c2lnbmF0dXJlOwogICAgZHAzOEFNYXBTdGF0ZS51c2VyTW92ZWQ9ZmFsc2U7CiAgICBkcDM4QUNsYW1wVmlldygpOwogIH0KCiAgZnVuY3Rpb24gZHAzOEFDaGFuZ2Vab29tKGRlbHRhLGFuY2hvclgsYW5jaG9yWSx3aWR0aCxoZWlnaHQpewogICAgY29uc3Qgb2xkWm9vbT1kcDM4QU1hcFN0YXRlLnpvb207CiAgICBjb25zdCBuZXdab29tPU1hdGgubWF4KDMsTWF0aC5taW4oMTksb2xkWm9vbStkZWx0YSkpOwogICAgaWYobmV3Wm9vbT09PW9sZFpvb20pcmV0dXJuOwogICAgY29uc3Qgc2NhbGU9TWF0aC5wb3coMixuZXdab29tLW9sZFpvb20pOwogICAgY29uc3QgYXg9TnVtYmVyLmlzRmluaXRlKGFuY2hvclgpP2FuY2hvclg6d2lkdGgvMjsKICAgIGNvbnN0IGF5PU51bWJlci5pc0Zpbml0ZShhbmNob3JZKT9hbmNob3JZOmhlaWdodC8yOwogICAgY29uc3Qgb2xkTGVmdD1kcDM4QU1hcFN0YXRlLmNlbnRlclgtd2lkdGgvMjsKICAgIGNvbnN0IG9sZFRvcD1kcDM4QU1hcFN0YXRlLmNlbnRlclktaGVpZ2h0LzI7CiAgICBjb25zdCB3b3JsZEFuY2hvclg9b2xkTGVmdCtheDsKICAgIGNvbnN0IHdvcmxkQW5jaG9yWT1vbGRUb3ArYXk7CiAgICBkcDM4QU1hcFN0YXRlLnpvb209bmV3Wm9vbTsKICAgIGRwMzhBTWFwU3RhdGUuY2VudGVyWD13b3JsZEFuY2hvclgqc2NhbGUtYXgrd2lkdGgvMjsKICAgIGRwMzhBTWFwU3RhdGUuY2VudGVyWT13b3JsZEFuY2hvclkqc2NhbGUtYXkraGVpZ2h0LzI7CiAgICBkcDM4QU1hcFN0YXRlLnVzZXJNb3ZlZD10cnVlOwogICAgZHAzOEFDbGFtcFZpZXcoKTsKICB9CgogIGZ1bmN0aW9uIGRwMzhBQmluZEludGVyYWN0aW9uKGNhbnZhcyxsYXllcix3aWR0aCxoZWlnaHQpewogICAgY2FudmFzLnN0eWxlLnRvdWNoQWN0aW9uPSdub25lJzsKICAgIGNhbnZhcy5zdHlsZS5jdXJzb3I9J2dyYWInOwoKICAgIGNvbnN0IHBvaW50PShldik9Pih7eDpldi5jbGllbnRYLHk6ZXYuY2xpZW50WX0pOwoKICAgIGNhbnZhcy5hZGRFdmVudExpc3RlbmVyKCdwb2ludGVyZG93bicsZXY9PnsKICAgICAgaWYoZXYudGFyZ2V0Py5jbG9zZXN0Py4oJy5kcDM4QU1hcmtlciwuZHAzOEFDb250cm9sJykpcmV0dXJuOwogICAgICB0cnl7Y2FudmFzLnNldFBvaW50ZXJDYXB0dXJlKGV2LnBvaW50ZXJJZCk7fWNhdGNoKF8pe30KICAgICAgY29uc3QgcD1wb2ludChldik7CiAgICAgIGRwMzhBTWFwU3RhdGUucG9pbnRlcnMuc2V0KGV2LnBvaW50ZXJJZCx7Li4ucCxzdGFydFg6cC54LHN0YXJ0WTpwLnl9KTsKICAgICAgaWYoZHAzOEFNYXBTdGF0ZS5wb2ludGVycy5zaXplPT09MSl7CiAgICAgICAgZHAzOEFNYXBTdGF0ZS5nZXN0dXJlPXsKICAgICAgICAgIG1vZGU6J3BhbicsCiAgICAgICAgICBzdGFydFg6cC54LHN0YXJ0WTpwLnksCiAgICAgICAgICBjZW50ZXJYOmRwMzhBTWFwU3RhdGUuY2VudGVyWCwKICAgICAgICAgIGNlbnRlclk6ZHAzOEFNYXBTdGF0ZS5jZW50ZXJZCiAgICAgICAgfTsKICAgICAgICBjYW52YXMuc3R5bGUuY3Vyc29yPSdncmFiYmluZyc7CiAgICAgIH1lbHNlIGlmKGRwMzhBTWFwU3RhdGUucG9pbnRlcnMuc2l6ZT09PTIpewogICAgICAgIGNvbnN0IGE9Wy4uLmRwMzhBTWFwU3RhdGUucG9pbnRlcnMudmFsdWVzKCldOwogICAgICAgIGNvbnN0IGR4PWFbMV0ueC1hWzBdLngsZHk9YVsxXS55LWFbMF0ueTsKICAgICAgICBkcDM4QU1hcFN0YXRlLmdlc3R1cmU9ewogICAgICAgICAgbW9kZToncGluY2gnLAogICAgICAgICAgZGlzdGFuY2U6TWF0aC5tYXgoMSxNYXRoLmh5cG90KGR4LGR5KSksCiAgICAgICAgICB6b29tOmRwMzhBTWFwU3RhdGUuem9vbSwKICAgICAgICAgIGNlbnRlclg6ZHAzOEFNYXBTdGF0ZS5jZW50ZXJYLAogICAgICAgICAgY2VudGVyWTpkcDM4QU1hcFN0YXRlLmNlbnRlclksCiAgICAgICAgICBtaWRYOihhWzBdLngrYVsxXS54KS8yLAogICAgICAgICAgbWlkWTooYVswXS55K2FbMV0ueSkvMiwKICAgICAgICAgIHJhdGlvOjEKICAgICAgICB9OwogICAgICB9CiAgICAgIGV2LnByZXZlbnREZWZhdWx0KCk7CiAgICB9KTsKCiAgICBjYW52YXMuYWRkRXZlbnRMaXN0ZW5lcigncG9pbnRlcm1vdmUnLGV2PT57CiAgICAgIGNvbnN0IHA9ZHAzOEFNYXBTdGF0ZS5wb2ludGVycy5nZXQoZXYucG9pbnRlcklkKTsKICAgICAgaWYoIXApcmV0dXJuOwogICAgICBwLng9ZXYuY2xpZW50WDtwLnk9ZXYuY2xpZW50WTsKICAgICAgY29uc3QgZz1kcDM4QU1hcFN0YXRlLmdlc3R1cmU7CiAgICAgIGlmKCFnKXJldHVybjsKCiAgICAgIGlmKGcubW9kZT09PSdwYW4nJiZkcDM4QU1hcFN0YXRlLnBvaW50ZXJzLnNpemU9PT0xKXsKICAgICAgICBjb25zdCBkeD1ldi5jbGllbnRYLWcuc3RhcnRYLGR5PWV2LmNsaWVudFktZy5zdGFydFk7CiAgICAgICAgbGF5ZXIuc3R5bGUudHJhbnNmb3JtPSd0cmFuc2xhdGUoJytkeCsncHgsJytkeSsncHgpJzsKICAgICAgfWVsc2UgaWYoZy5tb2RlPT09J3BpbmNoJyYmZHAzOEFNYXBTdGF0ZS5wb2ludGVycy5zaXplPj0yKXsKICAgICAgICBjb25zdCBhPVsuLi5kcDM4QU1hcFN0YXRlLnBvaW50ZXJzLnZhbHVlcygpXS5zbGljZSgwLDIpOwogICAgICAgIGNvbnN0IGR4PWFbMV0ueC1hWzBdLngsZHk9YVsxXS55LWFbMF0ueTsKICAgICAgICBjb25zdCBkaXN0PU1hdGgubWF4KDEsTWF0aC5oeXBvdChkeCxkeSkpOwogICAgICAgIGcucmF0aW89TWF0aC5tYXgoLjQ1LE1hdGgubWluKDIuNCxkaXN0L2cuZGlzdGFuY2UpKTsKICAgICAgICBjb25zdCByZWN0PWNhbnZhcy5nZXRCb3VuZGluZ0NsaWVudFJlY3QoKTsKICAgICAgICBjb25zdCBteD0oKGFbMF0ueCthWzFdLngpLzIpLXJlY3QubGVmdDsKICAgICAgICBjb25zdCBteT0oKGFbMF0ueSthWzFdLnkpLzIpLXJlY3QudG9wOwogICAgICAgIGxheWVyLnN0eWxlLnRyYW5zZm9ybU9yaWdpbj1teCsncHggJytteSsncHgnOwogICAgICAgIGxheWVyLnN0eWxlLnRyYW5zZm9ybT0nc2NhbGUoJytnLnJhdGlvKycpJzsKICAgICAgfQogICAgICBldi5wcmV2ZW50RGVmYXVsdCgpOwogICAgfSk7CgogICAgY29uc3QgZmluaXNoPShldik9PnsKICAgICAgY29uc3QgZz1kcDM4QU1hcFN0YXRlLmdlc3R1cmU7CiAgICAgIGlmKGcpewogICAgICAgIGlmKGcubW9kZT09PSdwYW4nKXsKICAgICAgICAgIGNvbnN0IHA9ZHAzOEFNYXBTdGF0ZS5wb2ludGVycy5nZXQoZXYucG9pbnRlcklkKTsKICAgICAgICAgIGNvbnN0IGV4PXA/cC54OmV2LmNsaWVudFgsZXk9cD9wLnk6ZXYuY2xpZW50WTsKICAgICAgICAgIGRwMzhBTWFwU3RhdGUuY2VudGVyWD1nLmNlbnRlclgtKGV4LWcuc3RhcnRYKTsKICAgICAgICAgIGRwMzhBTWFwU3RhdGUuY2VudGVyWT1nLmNlbnRlclktKGV5LWcuc3RhcnRZKTsKICAgICAgICAgIGRwMzhBTWFwU3RhdGUudXNlck1vdmVkPXRydWU7CiAgICAgICAgfWVsc2UgaWYoZy5tb2RlPT09J3BpbmNoJyl7CiAgICAgICAgICBsZXQgZGVsdGE9TWF0aC5yb3VuZChNYXRoLmxvZyhnLnJhdGlvfHwxKS9NYXRoLkxOMik7CiAgICAgICAgICBpZihkZWx0YT09PTAmJmcucmF0aW8+MS4xOClkZWx0YT0xOwogICAgICAgICAgaWYoZGVsdGE9PT0wJiZnLnJhdGlvPC44NSlkZWx0YT0tMTsKICAgICAgICAgIGlmKGRlbHRhKXsKICAgICAgICAgICAgZHAzOEFNYXBTdGF0ZS5jZW50ZXJYPWcuY2VudGVyWDsKICAgICAgICAgICAgZHAzOEFNYXBTdGF0ZS5jZW50ZXJZPWcuY2VudGVyWTsKICAgICAgICAgICAgY29uc3QgcmVjdD1jYW52YXMuZ2V0Qm91bmRpbmdDbGllbnRSZWN0KCk7CiAgICAgICAgICAgIGRwMzhBQ2hhbmdlWm9vbSgKICAgICAgICAgICAgICBkZWx0YSwKICAgICAgICAgICAgICBNYXRoLm1heCgwLE1hdGgubWluKHdpZHRoLGcubWlkWC1yZWN0LmxlZnQpKSwKICAgICAgICAgICAgICBNYXRoLm1heCgwLE1hdGgubWluKGhlaWdodCxnLm1pZFktcmVjdC50b3ApKSwKICAgICAgICAgICAgICB3aWR0aCxoZWlnaHQKICAgICAgICAgICAgKTsKICAgICAgICAgIH0KICAgICAgICB9CiAgICAgIH0KICAgICAgZHAzOEFNYXBTdGF0ZS5wb2ludGVycy5jbGVhcigpOwogICAgICBkcDM4QU1hcFN0YXRlLmdlc3R1cmU9bnVsbDsKICAgICAgZHAzOEFDbGFtcFZpZXcoKTsKICAgICAgY2FudmFzLnN0eWxlLmN1cnNvcj0nZ3JhYic7CiAgICAgIGRwMzFHUmVuZGVyQmluTWFwKCk7CiAgICB9OwoKICAgIGNhbnZhcy5hZGRFdmVudExpc3RlbmVyKCdwb2ludGVydXAnLGZpbmlzaCk7CiAgICBjYW52YXMuYWRkRXZlbnRMaXN0ZW5lcigncG9pbnRlcmNhbmNlbCcsZmluaXNoKTsKCiAgICBjYW52YXMuYWRkRXZlbnRMaXN0ZW5lcignd2hlZWwnLGV2PT57CiAgICAgIGlmKCFldi5kZWx0YVkpcmV0dXJuOwogICAgICBldi5wcmV2ZW50RGVmYXVsdCgpOwogICAgICBjb25zdCByZWN0PWNhbnZhcy5nZXRCb3VuZGluZ0NsaWVudFJlY3QoKTsKICAgICAgZHAzOEFDaGFuZ2Vab29tKGV2LmRlbHRhWTwwPzE6LTEsZXYuY2xpZW50WC1yZWN0LmxlZnQsZXYuY2xpZW50WS1yZWN0LnRvcCx3aWR0aCxoZWlnaHQpOwogICAgICBkcDMxR1JlbmRlckJpbk1hcCgpOwogICAgfSx7cGFzc2l2ZTpmYWxzZX0pOwogIH0KCiAgZnVuY3Rpb24gZHAzMUdSZW5kZXJCaW5NYXAoKXsKICAgIGNvbnN0IGNhbnZhcz1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZHAzMUdNYXBDYW52YXMnKTsKICAgIGNvbnN0IHN1bW1hcnk9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2RwMzFHTWFwU3VtbWFyeScpOwogICAgY29uc3QgbWlzc2luZ0JveD1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZHAzMUdNYXBNaXNzaW5nJyk7CiAgICBpZighY2FudmFzfHwhc3VtbWFyeXx8IW1pc3NpbmdCb3gpcmV0dXJuOwoKICAgIGNvbnN0IGFsbD1kcDMxR0ZpbHRlcmVkUGxhY2VkQmlucygpOwogICAgY29uc3QgY3VycmVudD1hbGwuZmlsdGVyKGRwMzFHSXNHcHNDdXJyZW50KTsKICAgIGNvbnN0IG1pc3Npbmc9YWxsLmZpbHRlcihiPT4hZHAzMUdJc0dwc0N1cnJlbnQpOwoKICAgIHN1bW1hcnkudGV4dENvbnRlbnQ9Y3VycmVudC5sZW5ndGgrJyBhdWYgS2FydGUgwrcgJyttaXNzaW5nLmxlbmd0aCsnIFN0YW5kb3J0IGZlaGx0IC8gbmljaHQgYWt0dWVsbCc7CgogICAgbWlzc2luZ0JveC5zdHlsZS5kaXNwbGF5PW1pc3NpbmcubGVuZ3RoPycnOidub25lJzsKICAgIG1pc3NpbmdCb3guaW5uZXJIVE1MPW1pc3NpbmcubGVuZ3RoPwogICAgICAnPGRpdiBjbGFzcz0ic21hbGwiPjxzdHJvbmc+T2huZSBha3R1ZWxsZW4gU3RhbmRvcnQ6PC9zdHJvbmc+ICcrCiAgICAgIG1pc3NpbmcubWFwKGI9Pic8YnV0dG9uIGNsYXNzPSJidG4gc2Vjb25kYXJ5IGRwMzFHTWlzc2luZ0JpbiIgc3R5bGU9InBhZGRpbmc6M3B4IDdweDttYXJnaW46MnB4IiB0eXBlPSJidXR0b24iIGRhdGEtaWQ9IicrZHAzMUdFc2MoYi5pZCkrJyI+JytkcDMxR0VzYyhiLm51bWJlcikrJzwvYnV0dG9uPicpLmpvaW4oJycpKwogICAgICAnPC9kaXY+JzonJzsKICAgIG1pc3NpbmdCb3gucXVlcnlTZWxlY3RvckFsbCgnLmRwMzFHTWlzc2luZ0JpbicpLmZvckVhY2goYnRuPT5idG4uYWRkRXZlbnRMaXN0ZW5lcignY2xpY2snLCgpPT57CiAgICAgIGNvbnN0IGI9KHN0YXRlPy5iaW5zfHxbXSkuZmluZCh4PT5TdHJpbmcoeC5pZCk9PT1TdHJpbmcoYnRuLmRhdGFzZXQuaWQpKTsKICAgICAgaWYoYiYmdHlwZW9mIG9wZW5CaW49PT0nZnVuY3Rpb24nKW9wZW5CaW4oYi5pZCk7CiAgICB9KSk7CgogICAgY2FudmFzLmlubmVySFRNTD0nJzsKICAgIGNvbnN0IGluZm89ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2RwMzFHTWFwSW5mbycpOwogICAgaWYoaW5mbyl7aW5mby5pbm5lckhUTUw9Jyc7aW5mby5zdHlsZS5kaXNwbGF5PSdub25lJzt9CgogICAgaWYoIWN1cnJlbnQubGVuZ3RoKXsKICAgICAgY2FudmFzLmlubmVySFRNTD0nPGRpdiBjbGFzcz0ic21hbGwiIHN0eWxlPSJwYWRkaW5nOjE4cHgiPkbDvHIgZGllc2VuIEZpbHRlciBnaWJ0IGVzIGtlaW5lIGdlc3RlbGx0ZSBNdWxkZSBtaXQgYWt0dWVsbGVtIEdQUy1TdGFuZG9ydC48L2Rpdj4nOwogICAgICBjYW52YXMuc3R5bGUuaGVpZ2h0PSdhdXRvJzsKICAgICAgcmV0dXJuOwogICAgfQoKICAgIGNvbnN0IHdpZHRoPU1hdGgubWF4KDI4MCxNYXRoLnJvdW5kKGNhbnZhcy5jbGllbnRXaWR0aHx8NjQwKSk7CiAgICBjb25zdCBoZWlnaHQ9TWF0aC5tYXgoMzIwLE1hdGgubWluKDUyMCxNYXRoLnJvdW5kKHdpZHRoKjAuNjgpKSk7CiAgICBjYW52YXMuc3R5bGUuaGVpZ2h0PWhlaWdodCsncHgnOwogICAgY2FudmFzLnN0eWxlLnBvc2l0aW9uPSdyZWxhdGl2ZSc7CiAgICBjYW52YXMuc3R5bGUub3ZlcmZsb3c9J2hpZGRlbic7CiAgICBjYW52YXMuc3R5bGUuYmFja2dyb3VuZD0nI2U1ZTdlYic7CiAgICBjYW52YXMuc3R5bGUuYm9yZGVyUmFkaXVzPSc4cHgnOwoKICAgIGNvbnN0IHE9ZHAzMUdUZXh0KGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdiaW5TZWFyY2gnKT8udmFsdWUpLnRvTG9jYWxlTG93ZXJDYXNlKCdkZScpOwogICAgY29uc3QgdHlwZT1kcDMxR1RleHQoZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2RwMzFHQmluVHlwZUZpbHRlcicpPy52YWx1ZSk7CiAgICBjb25zdCBzaWduYXR1cmU9Y3VycmVudC5tYXAoYj0+WwogICAgICBiLmlkLGIubnVtYmVyLGIuZ3BzTGF0LGIuZ3BzTG9uLGIuZ3BzQXQsYi5ncHNDdXJyZW50CiAgICBdLm1hcChkcDMxR1RleHQpLmpvaW4oJzonKSkuc29ydCgpLmpvaW4oJ3wnKSsnfHwnK3ErJ3x8Jyt0eXBlOwoKICAgIGlmKGRwMzhBTWFwU3RhdGUuc2lnbmF0dXJlIT09c2lnbmF0dXJlfHwKICAgICAgICFOdW1iZXIuaXNGaW5pdGUoZHAzOEFNYXBTdGF0ZS5jZW50ZXJYKXx8CiAgICAgICAhTnVtYmVyLmlzRmluaXRlKGRwMzhBTWFwU3RhdGUuY2VudGVyWSkpewogICAgICBkcDM4QUZpdChjdXJyZW50LHdpZHRoLGhlaWdodCxzaWduYXR1cmUpOwogICAgfQoKICAgIGNvbnN0IHpvb209ZHAzOEFNYXBTdGF0ZS56b29tOwogICAgZHAzOEFDbGFtcFZpZXcoKTsKICAgIGNvbnN0IGxlZnQ9ZHAzOEFNYXBTdGF0ZS5jZW50ZXJYLXdpZHRoLzI7CiAgICBjb25zdCB0b3A9ZHAzOEFNYXBTdGF0ZS5jZW50ZXJZLWhlaWdodC8yOwoKICAgIGNvbnN0IGxheWVyPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoJ2RpdicpOwogICAgbGF5ZXIuaWQ9J2RwMzhBTWFwTGF5ZXInOwogICAgbGF5ZXIuc3R5bGUuY3NzVGV4dD0ncG9zaXRpb246YWJzb2x1dGU7aW5zZXQ6MDt0cmFuc2Zvcm0tb3JpZ2luOmNlbnRlciBjZW50ZXI7d2lsbC1jaGFuZ2U6dHJhbnNmb3JtJzsKICAgIGNhbnZhcy5hcHBlbmRDaGlsZChsYXllcik7CgogICAgY29uc3QgbWF4VGlsZT1NYXRoLnBvdygyLHpvb20pOwogICAgY29uc3QgeDA9TWF0aC5mbG9vcihsZWZ0LzI1NiktMSx4MT1NYXRoLmZsb29yKChsZWZ0K3dpZHRoKS8yNTYpKzE7CiAgICBjb25zdCB5MD1NYXRoLm1heCgwLE1hdGguZmxvb3IodG9wLzI1NiktMSkseTE9TWF0aC5taW4obWF4VGlsZS0xLE1hdGguZmxvb3IoKHRvcCtoZWlnaHQpLzI1NikrMSk7CgogICAgZm9yKGxldCB0eD14MDt0eDw9eDE7dHgrKylmb3IobGV0IHR5PXkwO3R5PD15MTt0eSsrKXsKICAgICAgY29uc3QgaW1nPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoJ2ltZycpOwogICAgICBjb25zdCB3cmFwcGVkPSgodHglbWF4VGlsZSkrbWF4VGlsZSklbWF4VGlsZTsKICAgICAgaW1nLnNyYz0naHR0cHM6Ly90aWxlLm9wZW5zdHJlZXRtYXAub3JnLycrem9vbSsnLycrd3JhcHBlZCsnLycrdHkrJy5wbmcnOwogICAgICBpbWcuYWx0PScnO2ltZy5sb2FkaW5nPSdsYXp5JztpbWcuZHJhZ2dhYmxlPWZhbHNlOwogICAgICBpbWcuYWRkRXZlbnRMaXN0ZW5lcignZXJyb3InLCgpPT57CiAgICAgICAgaWYoY2FudmFzLmRhdGFzZXQudGlsZUVycm9yU2hvd249PT0nMScpcmV0dXJuOwogICAgICAgIGNhbnZhcy5kYXRhc2V0LnRpbGVFcnJvclNob3duPScxJzsKICAgICAgICBjb25zdCB3YXJuPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoJ2RpdicpOwogICAgICAgIHdhcm4uY2xhc3NOYW1lPSdzbWFsbCc7CiAgICAgICAgd2Fybi50ZXh0Q29udGVudD0nS2FydGVua2FjaGVsbiBrb25udGVuIG5pY2h0IGdlbGFkZW4gd2VyZGVuLiBCaXR0ZSBWZXJiaW5kdW5nIHByw7xmZW4uJzsKICAgICAgICB3YXJuLnN0eWxlLmNzc1RleHQ9J3Bvc2l0aW9uOmFic29sdXRlO3otaW5kZXg6ODtsZWZ0OjhweDtyaWdodDo4cHg7dG9wOjhweDtiYWNrZ3JvdW5kOnJnYmEoMjU1LDI1NSwyNTUsLjk0KTtwYWRkaW5nOjhweDtib3JkZXItcmFkaXVzOjhweCc7CiAgICAgICAgY2FudmFzLmFwcGVuZENoaWxkKHdhcm4pOwogICAgICB9KTsKICAgICAgaW1nLnN0eWxlLmNzc1RleHQ9J3Bvc2l0aW9uOmFic29sdXRlO3dpZHRoOjI1NnB4O2hlaWdodDoyNTZweDttYXgtd2lkdGg6bm9uZTt1c2VyLXNlbGVjdDpub25lO3BvaW50ZXItZXZlbnRzOm5vbmU7bGVmdDonKyh0eCoyNTYtbGVmdCkrJ3B4O3RvcDonKyh0eSoyNTYtdG9wKSsncHgnOwogICAgICBsYXllci5hcHBlbmRDaGlsZChpbWcpOwogICAgfQoKICAgIGN1cnJlbnQuZm9yRWFjaChiPT57CiAgICAgIGNvbnN0IHA9ZHAzMUdXb3JsZFBvaW50KGIuZ3BzTGF0LGIuZ3BzTG9uLHpvb20pOwogICAgICBjb25zdCB4PXAueC1sZWZ0LHk9cC55LXRvcDsKICAgICAgaWYoeDwtNDB8fHg+d2lkdGgrNDB8fHk8LTQwfHx5PmhlaWdodCs0MClyZXR1cm47CiAgICAgIGNvbnN0IGJ0bj1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCdidXR0b24nKTsKICAgICAgYnRuLnR5cGU9J2J1dHRvbic7CiAgICAgIGJ0bi5jbGFzc05hbWU9J2RwMzhBTWFya2VyJzsKICAgICAgYnRuLnRleHRDb250ZW50PWRwMzFHVGV4dChiLm51bWJlcik7CiAgICAgIGJ0bi50aXRsZT0nTXVsZGUgJytkcDMxR1RleHQoYi5udW1iZXIpKycgwrcgJytkcDMxR1RleHQoYi50eXBlfHwnJyk7CiAgICAgIGJ0bi5zdHlsZS5jc3NUZXh0PQogICAgICAgICdwb3NpdGlvbjphYnNvbHV0ZTt6LWluZGV4OjQ7bGVmdDonK3grJ3B4O3RvcDonK3krJ3B4O3RyYW5zZm9ybTp0cmFuc2xhdGUoLTUwJSwtMTAwJSk7JysKICAgICAgICAnbWluLXdpZHRoOjA7aGVpZ2h0OjI3cHg7cGFkZGluZzowIDdweDtib3JkZXI6MnB4IHNvbGlkICNmZmY7Ym9yZGVyLXJhZGl1czoxNHB4OycrCiAgICAgICAgJ2JhY2tncm91bmQ6IzE0NTMyZDtjb2xvcjojZmZmO2ZvbnQ6NzAwIDExcHgvMjNweCBBcmlhbCxzYW5zLXNlcmlmOycrCiAgICAgICAgJ2JveC1zaGFkb3c6MCAxcHggNHB4IHJnYmEoMCwwLDAsLjM1KTt3aGl0ZS1zcGFjZTpub3dyYXA7dG91Y2gtYWN0aW9uOm1hbmlwdWxhdGlvbic7CiAgICAgIGJ0bi5hZGRFdmVudExpc3RlbmVyKCdwb2ludGVyZG93bicsZXY9PmV2LnN0b3BQcm9wYWdhdGlvbigpKTsKICAgICAgYnRuLmFkZEV2ZW50TGlzdGVuZXIoJ2NsaWNrJyxldj0+ewogICAgICAgIGV2LnN0b3BQcm9wYWdhdGlvbigpOwogICAgICAgIGlmKGluZm8paW5mby5zdHlsZS5kaXNwbGF5PScnOwogICAgICAgIGRwMzFHTWFwSW5mbyhiKTsKICAgICAgfSk7CiAgICAgIGxheWVyLmFwcGVuZENoaWxkKGJ0bik7CiAgICB9KTsKCiAgICBjb25zdCBjb250cm9scz1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCdkaXYnKTsKICAgIGNvbnRyb2xzLmNsYXNzTmFtZT0nZHAzOEFDb250cm9sJzsKICAgIGNvbnRyb2xzLnN0eWxlLmNzc1RleHQ9J3Bvc2l0aW9uOmFic29sdXRlO3otaW5kZXg6NztsZWZ0OjhweDt0b3A6OHB4O2Rpc3BsYXk6Z3JpZDtnYXA6NXB4JzsKICAgIGNvbnRyb2xzLmlubmVySFRNTD0KICAgICAgJzxidXR0b24gY2xhc3M9ImRwMzhBQ29udHJvbCBidG4gc2Vjb25kYXJ5IiBpZD0iZHAzOEFab29tSW4iIHR5cGU9ImJ1dHRvbiIgYXJpYS1sYWJlbD0iS2FydGUgdmVyZ3LDtsOfZXJuIiBzdHlsZT0ibWluLXdpZHRoOjM2cHg7cGFkZGluZzo2cHggOXB4Ij4rPC9idXR0b24+JysKICAgICAgJzxidXR0b24gY2xhc3M9ImRwMzhBQ29udHJvbCBidG4gc2Vjb25kYXJ5IiBpZD0iZHAzOEFab29tT3V0IiB0eXBlPSJidXR0b24iIGFyaWEtbGFiZWw9IkthcnRlIHZlcmtsZWluZXJuIiBzdHlsZT0ibWluLXdpZHRoOjM2cHg7cGFkZGluZzo2cHggOXB4Ij7iiJI8L2J1dHRvbj4nKwogICAgICAnPGJ1dHRvbiBjbGFzcz0iZHAzOEFDb250cm9sIGJ0biBzZWNvbmRhcnkiIGlkPSJkcDM4QUZpdCIgdHlwZT0iYnV0dG9uIiBhcmlhLWxhYmVsPSJBbGxlIE11bGRlbiB6ZW50cmllcmVuIiBzdHlsZT0ibWluLXdpZHRoOjM2cHg7cGFkZGluZzo2cHggOXB4Ij7il448L2J1dHRvbj4nOwogICAgY2FudmFzLmFwcGVuZENoaWxkKGNvbnRyb2xzKTsKCiAgICBjb250cm9scy5xdWVyeVNlbGVjdG9yKCcjZHAzOEFab29tSW4nKT8uYWRkRXZlbnRMaXN0ZW5lcignY2xpY2snLGV2PT57CiAgICAgIGV2LnN0b3BQcm9wYWdhdGlvbigpO2RwMzhBQ2hhbmdlWm9vbSgxLHdpZHRoLzIsaGVpZ2h0LzIsd2lkdGgsaGVpZ2h0KTtkcDMxR1JlbmRlckJpbk1hcCgpOwogICAgfSk7CiAgICBjb250cm9scy5xdWVyeVNlbGVjdG9yKCcjZHAzOEFab29tT3V0Jyk/LmFkZEV2ZW50TGlzdGVuZXIoJ2NsaWNrJyxldj0+ewogICAgICBldi5zdG9wUHJvcGFnYXRpb24oKTtkcDM4QUNoYW5nZVpvb20oLTEsd2lkdGgvMixoZWlnaHQvMix3aWR0aCxoZWlnaHQpO2RwMzFHUmVuZGVyQmluTWFwKCk7CiAgICB9KTsKICAgIGNvbnRyb2xzLnF1ZXJ5U2VsZWN0b3IoJyNkcDM4QUZpdCcpPy5hZGRFdmVudExpc3RlbmVyKCdjbGljaycsZXY9PnsKICAgICAgZXYuc3RvcFByb3BhZ2F0aW9uKCk7ZHAzOEFSZXNldFZpZXcoKTtkcDMxR1JlbmRlckJpbk1hcCgpOwogICAgfSk7CgogICAgY29uc3QgYXR0PWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoJ2RpdicpOwogICAgYXR0LmNsYXNzTmFtZT0nZHAzOEFDb250cm9sJzsKICAgIGF0dC5pbm5lckhUTUw9JzxhIGhyZWY9Imh0dHBzOi8vd3d3Lm9wZW5zdHJlZXRtYXAub3JnL2NvcHlyaWdodCIgdGFyZ2V0PSJfYmxhbmsiIHJlbD0ibm9vcGVuZXIgbm9yZWZlcnJlciIgc3R5bGU9ImNvbG9yOmluaGVyaXQ7dGV4dC1kZWNvcmF0aW9uOnVuZGVybGluZSI+wqkgT3BlblN0cmVldE1hcCBjb250cmlidXRvcnM8L2E+JzsKICAgIGF0dC5zdHlsZS5jc3NUZXh0PSdwb3NpdGlvbjphYnNvbHV0ZTt6LWluZGV4Ojc7cmlnaHQ6NHB4O2JvdHRvbTozcHg7YmFja2dyb3VuZDpyZ2JhKDI1NSwyNTUsMjU1LC44OCk7cGFkZGluZzoycHggNXB4O2JvcmRlci1yYWRpdXM6NHB4O2ZvbnQtc2l6ZToxMHB4JzsKICAgIGNhbnZhcy5hcHBlbmRDaGlsZChhdHQpOwoKICAgIGRwMzhBQmluZEludGVyYWN0aW9uKGNhbnZhcyxsYXllcix3aWR0aCxoZWlnaHQpOwogIH0KCiAg').decode('utf-8')
+          set_view_block=base64.b64decode('ZnVuY3Rpb24gZHAzMUdTZXRCaW5WaWV3KG1vZGUpewogICAgY29uc3QgbGlzdD1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYmluTGlzdCcpOwogICAgY29uc3QgbWFwPWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdkcDMxR0Jpbk1hcFBhbmVsJyk7CiAgICBjb25zdCBsaXN0QnRuPWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdkcDMxR1ZpZXdMaXN0Jyk7CiAgICBjb25zdCBtYXBCdG49ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2RwMzFHVmlld01hcCcpOwogICAgY29uc3QgaXNNYXA9bW9kZT09PSdtYXAnOwogICAgaWYobGlzdClsaXN0LnN0eWxlLmRpc3BsYXk9aXNNYXA/J25vbmUnOicnOwogICAgaWYobWFwKW1hcC5zdHlsZS5kaXNwbGF5PWlzTWFwPycnOidub25lJzsKICAgIGxpc3RCdG4/LmNsYXNzTGlzdC50b2dnbGUoJ3ByaW1hcnknLCFpc01hcCk7CiAgICBsaXN0QnRuPy5jbGFzc0xpc3QudG9nZ2xlKCdzZWNvbmRhcnknLGlzTWFwKTsKICAgIG1hcEJ0bj8uY2xhc3NMaXN0LnRvZ2dsZSgncHJpbWFyeScsaXNNYXApOwogICAgbWFwQnRuPy5jbGFzc0xpc3QudG9nZ2xlKCdzZWNvbmRhcnknLCFpc01hcCk7CiAgICBpZihpc01hcCl7CiAgICAgIGRwMzhBUmVzZXRWaWV3KCk7CiAgICAgIHNldFRpbWVvdXQoZHAzMUdSZW5kZXJCaW5NYXAsMCk7CiAgICB9CiAgfQoKICA=').decode('utf-8')
+          install_block=base64.b64decode('ZnVuY3Rpb24gZHAzMUdJbnN0YWxsQmluTWFwVWkoKXsKICAgIGNvbnN0IHNlYXJjaD1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYmluU2VhcmNoJyk7CiAgICBpZighc2VhcmNofHxkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZHAzMUdCaW5NYXBUb29scycpKXJldHVybjsKCiAgICBzZWFyY2gucGxhY2Vob2xkZXI9J011bGRlbm51bW1lciwgS3VuZGUgb2RlciBCYXVzdGVsbGUnOwogICAgdHJ5e3NlYXJjaC5zZXRBdHRyaWJ1dGUoJ2FyaWEtbGFiZWwnLCdNdWxkZW5udW1tZXIsIEt1bmRlIG9kZXIgQmF1c3RlbGxlJyk7fWNhdGNoKF8pe30KCiAgICBjb25zdCBob3N0PXNlYXJjaC5wYXJlbnRFbGVtZW50OwogICAgaWYoIWhvc3QpcmV0dXJuOwoKICAgIGNvbnN0IHRvb2xzPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoJ2RpdicpOwogICAgdG9vbHMuaWQ9J2RwMzFHQmluTWFwVG9vbHMnOwogICAgdG9vbHMuc3R5bGUuY3NzVGV4dD0nZGlzcGxheTpmbGV4O2dhcDo2cHg7ZmxleC13cmFwOndyYXA7YWxpZ24taXRlbXM6Y2VudGVyO2ZsZXgtYmFzaXM6MTAwJTt3aWR0aDoxMDAlO21hcmdpbi10b3A6OHB4JzsKICAgIHRvb2xzLmlubmVySFRNTD0KICAgICAgJzxidXR0b24gaWQ9ImRwMzFHVmlld0xpc3QiIGNsYXNzPSJidG4gcHJpbWFyeSIgdHlwZT0iYnV0dG9uIj5MaXN0ZTwvYnV0dG9uPicrCiAgICAgICc8YnV0dG9uIGlkPSJkcDMxR1ZpZXdNYXAiIGNsYXNzPSJidG4gc2Vjb25kYXJ5IiB0eXBlPSJidXR0b24iPkthcnRlPC9idXR0b24+JysKICAgICAgJzxzZWxlY3QgaWQ9ImRwMzFHQmluVHlwZUZpbHRlciIgYXJpYS1sYWJlbD0iTXVsZGVudHlwIGZpbHRlcm4iIHN0eWxlPSJtaW4td2lkdGg6MTQ1cHg7bWF4LXdpZHRoOjIyMHB4Ij48b3B0aW9uIHZhbHVlPSIiPkFsbGUgVHlwZW48L29wdGlvbj48L3NlbGVjdD4nKwogICAgICAnPHNwYW4gaWQ9ImRwMzFHTWFwU3VtbWFyeSIgY2xhc3M9InNtYWxsIiBzdHlsZT0iZmxleC1iYXNpczoxMDAlO21hcmdpbi10b3A6MnB4Ij48L3NwYW4+JzsKCiAgICBob3N0LmFwcGVuZENoaWxkKHRvb2xzKTsKCiAgICBjb25zdCBwYW5lbD1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCdkaXYnKTsKICAgIHBhbmVsLmlkPSdkcDMxR0Jpbk1hcFBhbmVsJzsKICAgIHBhbmVsLnN0eWxlLmRpc3BsYXk9J25vbmUnOwogICAgcGFuZWwuaW5uZXJIVE1MPQogICAgICAnPGRpdiBjbGFzcz0iY2FyZCIgc3R5bGU9InBhZGRpbmc6MDtvdmVyZmxvdzpoaWRkZW4iPicrCiAgICAgICc8ZGl2IGlkPSJkcDMxR01hcENhbnZhcyIgc3R5bGU9IndpZHRoOjEwMCU7bWluLWhlaWdodDozMjBweCI+PC9kaXY+JysKICAgICAgJzwvZGl2PicrCiAgICAgICc8ZGl2IGlkPSJkcDMxR01hcEluZm8iIGNsYXNzPSJjYXJkIiBzdHlsZT0iZGlzcGxheTpub25lO21hcmdpbi10b3A6OHB4Ij48L2Rpdj4nKwogICAgICAnPGRpdiBpZD0iZHAzMUdNYXBNaXNzaW5nIiBzdHlsZT0iZGlzcGxheTpub25lO21hcmdpbi10b3A6NnB4Ij48L2Rpdj4nOwoKICAgIGhvc3QuYWZ0ZXIocGFuZWwpOwoKICAgIGRwMzFHUmVmcmVzaEJpbk1hcEZpbHRlcnMoKTsKCiAgICBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZHAzMUdWaWV3TGlzdCcpPy5hZGRFdmVudExpc3RlbmVyKCdjbGljaycsKCk9PmRwMzFHU2V0QmluVmlldygnbGlzdCcpKTsKICAgIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdkcDMxR1ZpZXdNYXAnKT8uYWRkRXZlbnRMaXN0ZW5lcignY2xpY2snLCgpPT5kcDMxR1NldEJpblZpZXcoJ21hcCcpKTsKICAgIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdkcDMxR0JpblR5cGVGaWx0ZXInKT8uYWRkRXZlbnRMaXN0ZW5lcignY2hhbmdlJywoKT0+ewogICAgICBkcDM4QVJlc2V0VmlldygpOwogICAgICBpZihkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZHAzMUdCaW5NYXBQYW5lbCcpPy5zdHlsZS5kaXNwbGF5IT09J25vbmUnKWRwMzFHUmVuZGVyQmluTWFwKCk7CiAgICB9KTsKICAgIHNlYXJjaC5hZGRFdmVudExpc3RlbmVyKCdpbnB1dCcsKCk9PnsKICAgICAgZHAzOEFSZXNldFZpZXcoKTsKICAgICAgaWYoZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2RwMzFHQmluTWFwUGFuZWwnKT8uc3R5bGUuZGlzcGxheSE9PSdub25lJylkcDMxR1JlbmRlckJpbk1hcCgpOwogICAgfSk7CiAgfQoKICA=').decode('utf-8')
+
+          def replace_region(text,start_token,end_token,replacement,label):
+              if text.count(start_token)!=1:
+                  raise SystemExit(f'038A: {label} Starttoken {text.count(start_token)}x statt 1x.')
+              start=text.index(start_token)
+              end=text.find(end_token,start+len(start_token))
+              if end<0:
+                  raise SystemExit(f'038A: {label} Endtoken fehlt.')
+              return text[:start]+replacement+text[end:]
+
+          src=replace_region(
+              src,
+              'function dp31GRenderBinMap(){',
+              'function dp31GRefreshBinMapFilters(){',
+              render_block,
+              'Kartenrenderer'
+          )
+          src=replace_region(
+              src,
+              'function dp31GSetBinView(mode){',
+              'function dp31GInstallBinMapUi(){',
+              set_view_block,
+              'Ansichtsumschalter'
+          )
+          src=replace_region(
+              src,
+              'function dp31GInstallBinMapUi(){',
+              'function dp31GContextBins(siteId){',
+              install_block,
+              'Karten-UI'
+          )
+
+          end_marker='/* DP13_PATCH_END */'
+          marker=r"""
+          /* DP_DLB_038A_1_16_0_27_MULDEN_SUCHE_KARTE_BEGIN */
+          (function(){
+            'use strict';
+            window.__DISPOLUX_038A={
+              version:'1.16.0.27',
+              feature:'Mulden-Suche/Karte integriert · Touch-Pan/Pinch-Zoom · kompakte Marker'
+            };
+          })();
+          /* DP_DLB_038A_1_16_0_27_MULDEN_SUCHE_KARTE_END */
+          """
+          if src.count(end_marker)!=1:
+              raise SystemExit(f'038A: DP13-Endmarker {src.count(end_marker)}x statt 1x.')
+          src=src.replace(end_marker,marker+'\n\n'+end_marker,1)
+
+          runtime.write_text(src,encoding='utf-8',newline='\n')
+          if runtime.suffix=='.js':
+              subprocess.run(['node','--check',str(runtime)],check=True)
+
+          pkg=Path('spfx-build/config/package-solution.json')
+          data=json.loads(pkg.read_text(encoding='utf-8'))
+          if data.get('solution',{}).get('version')!='1.3.6.119':
+              raise SystemExit('038A: erwartete 037E-SPFx-Version 1.3.6.119 fehlt.')
+          data['solution']['version']='1.3.6.121'
+          pkg.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+
+          print('038A: Mulden-Suche/Karte integriert, Touch-Karte eingebaut, Marker verkleinert.')
+          PY_PATCH_038A
+
+      - name: Validate 038A source before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VALIDATE_038A'
+          from pathlib import Path
+          import json,re,subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          combined='\n'.join(p.read_text(encoding='utf-8') for p in files)
+
+          begin='DP_DLB_038A_1_16_0_27_MULDEN_SUCHE_KARTE_BEGIN'
+          hits=[p for p in files if begin in p.read_text(encoding='utf-8')]
+          if len(hits)!=1:
+              raise SystemExit(f'038A VALIDIERUNG: Patch {len(hits)}x statt 1x gefunden.')
+
+          runtime=hits[0]
+          src=runtime.read_text(encoding='utf-8')
+
+          required=[
+              "__DISPOLUX_038A",
+              "version:'1.16.0.27'",
+              "Muldennummer, Kunde oder Baustelle",
+              "dp38AMapState",
+              "dp38AResetView",
+              "dp38AFit",
+              "dp38AChangeZoom",
+              "dp38ABindInteraction",
+              "pointerdown",
+              "pointermove",
+              "pointerup",
+              "wheel",
+              "touchAction='none'",
+              "dp38AMarker",
+              "height:27px",
+              "Alle Typen",
+              "OpenStreetMap contributors",
+              "dp31GMapInfo(b)",
+              "dp31GFilteredPlacedBins",
+              "dp31GIsGpsCurrent",
+              "dp31GViewList",
+              "dp31GViewMap",
+          ]
+          missing=[x for x in required if x not in src]
+          if missing:
+              raise SystemExit('038A VALIDIERUNG: Pflichtbestandteile fehlen: '+', '.join(missing))
+
+          # Die alte zweite Überschrift/zweite Suchkarte darf nicht mehr vorhanden sein.
+          if '<strong class="grow">Mulden suchen</strong>' in src:
+              raise SystemExit('038A VALIDIERUNG: alte doppelte Überschrift "Mulden suchen" ist noch vorhanden.')
+
+          # Bestehende Kernfunktionen müssen erhalten bleiben.
+          basis=[
+              'DP_DLB_037E_1_16_0_25_DP_DATA_HYGIENE_BACKUP_FILE_CONFIRM_BEGIN',
+              'DP_DLB_036D_1_16_0_20_OFFLINE_OUTBOX_SYNC_BEGIN',
+              'DP_DLB_035B_1_16_0_16_AUFTRAG_KONTAKT_MEHRMULDEN_MATERIAL_BEGIN',
+              'DP_DLB_034D_1_16_0_15_DP_DATA_STAMMDATEN_PERSISTENZ_BEGIN',
+              'DP_DLB_031G_1_16_0_6_STANDORTE_NAVIGATION_BEGIN',
+              'DispoLux:036D:offlineOutbox:v1',
+              'DispoLux_Backup',
+              'DP_Data bereinigt',
+              'warehouses','transportLocations','plannedBinMaterials','actualBinMaterials',
+              'Standort setzen','Navigation zur Baustelle',
+          ]
+          missing=[x for x in basis if x not in combined]
+          if missing:
+              raise SystemExit('038A VALIDIERUNG: bewährte Basis unvollständig: '+', '.join(missing))
+
+          if 'await dp28dBackup(fields, rows, force);' in combined:
+              raise SystemExit('038A VALIDIERUNG: alter DPB-Schreibaufruf wieder aktiv.')
+
+          pkg=json.loads(Path('spfx-build/config/package-solution.json').read_text(encoding='utf-8'))
+          if pkg.get('solution',{}).get('version')!='1.3.6.121':
+              raise SystemExit('038A VALIDIERUNG: SPFx-Version ist nicht 1.3.6.121.')
+
+          if runtime.suffix=='.js':
+              subprocess.run(['node','--check',str(runtime)],check=True)
+
+          print('038A VALIDIERUNG OK')
+          print('- Basis exakt 037E erhalten')
+          print('- nur eine Mulden-Suche; Kartensteuerung darin integriert')
+          print('- Touch-Pan, Pinch-Zoom, Mausrad und +/- Zoom vorhanden')
+          print('- Marker kompakt und Details erst nach Antippen')
+          print('- Suche + Typfilter wirken gemeinsam auf Karte')
+          PY_VALIDATE_038A
+
+      - name: Build and package 038A
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf spfx-build/release spfx-build/temp/deploy spfx-build/sharepoint/solution
+          (cd spfx-build && npx heft build --production)
+          (cd spfx-build && npx heft package-solution --production)
+
+          rm -rf artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n1)
+          test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          if [ -d spfx-build/release/assets ]; then
+            cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d spfx-build/temp/deploy ]; then
+            cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else
+            echo '038A: Keine SPFx Asset-Ausgabe gefunden.' >&2
+            exit 1
+          fi
+
+          if [ -f .dpx14_icon_b64 ]; then
+            python3 - <<'PY_ICON_038A'
+          from pathlib import Path
+          import base64
+          Path('artifact/UPLOAD_TO_SITEASSETS/DispoLux_DL_Icon_48.png').write_bytes(
+              base64.b64decode(Path('.dpx14_icon_b64').read_text().strip())
+          )
+          PY_ICON_038A
+          fi
+
+      - name: Validate emitted 038A package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COUNT=0
+          while IFS= read -r -d '' JS; do
+            test -s "$JS"
+            node --check "$JS"
+            COUNT=$((COUNT+1))
+          done < <(find artifact/UPLOAD_TO_SITEASSETS -maxdepth 1 -type f -name '*.js' -print0)
+          test "$COUNT" -gt 0
+          test -s artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          python3 - <<'PY_FINAL_038A'
+          from pathlib import Path
+
+          assets=Path('artifact/UPLOAD_TO_SITEASSETS')
+          js=list(assets.glob('*.js'))
+          current=[]
+          for p in js:
+              s=p.read_text(encoding='utf-8')
+              if '__DISPOLUX_038A' in s:
+                  current.append((p,s))
+          if len(current)!=1:
+              raise SystemExit(f'038A FINAL: aktueller Produktionsbundle {len(current)}x statt 1x gefunden: {[p.name for p,_ in current]}')
+
+          p,s=current[0]
+          required=[
+              '__DISPOLUX_037E',
+              '__DISPOLUX_038A',
+              'DispoLux:036D:offlineOutbox:v1',
+              'DispoLux_Backup',
+              'DP_Data bereinigt',
+              'Muldennummer, Kunde oder Baustelle',
+              'OpenStreetMap contributors',
+              'dp38AMarker',
+              'pointerdown',
+              'pointermove',
+              'Alle Typen',
+              'warehouses',
+              'transportLocations',
+              'plannedBinMaterials',
+              'actualBinMaterials',
+              'Standort setzen',
+          ]
+          missing=[x for x in required if x not in s]
+          if missing:
+              raise SystemExit('038A FINAL: Pflichtbestandteile fehlen: '+', '.join(missing))
+
+          if '<strong class="grow">Mulden suchen</strong>' in s:
+              raise SystemExit('038A FINAL: doppelte alte Mulden-suchen-Überschrift im Produktionsbundle gefunden.')
+
+          stale=[]
+          for q in js:
+              if q==p:continue
+              x=q.read_text(encoding='utf-8')
+              if 'sectionKeys' in x and 'DP_Data' in x:stale.append(q.name)
+          if stale:
+              raise SystemExit('038A FINAL: alte DP_Data-WebPart-Bundles im Auslieferungsordner: '+repr(stale))
+
+          print('038A FINAL OK')
+          print('- 037E Datenhaltung/Backup/Offline erhalten')
+          print('- Mulden-Suche und Karte als ein Bereich')
+          print('- Touch-Karte mit kompakten Markern enthalten')
+          PY_FINAL_038A
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DLB-038A-1.16.0.27 · MULDEN SUCHEN / KARTE MOBIL BEDIENBAR · SPFx 1.3.6.121
+
+          Basis:
+          - erfolgreicher DLB-037E-1.16.0.25
+          - 037F ausdrücklich NICHT als Basis
+          - Offline-Outbox, DP_Data-Bereinigung und Backup-Schutz bleiben erhalten
+
+          038A:
+          - bestehende zentrale Suche "Muldennummer, Kunde oder Baustelle" bleibt erhalten
+          - Liste/Karte und Typfilter werden direkt in diese Suche integriert
+          - keine zweite Überschrift/zweiter Bereich "Mulden suchen"
+          - Karte per Touch verschiebbar
+          - Pinch-to-Zoom auf Tablet/Smartphone
+          - zusätzlich +/- und Zentrieren sowie Mausrad-Zoom
+          - kompakte Marker zeigen im Normalzustand nur die Muldennummer
+          - Detailinformationen erst nach Antippen des Markers
+          - Suche filtert weiterhin Muldennummer, Kunde und Baustelle
+          - Typfilter: Alle Typen oder einzelner Muldentyp
+          - nur aktuell gestellte Mulden mit aktuellem GPS-Punkt auf der Karte
+          - fehlende/nicht aktuelle GPS-Punkte separat kompakt angezeigt
+          - OpenStreetMap-Kacheln und Attribution bleiben erhalten
+
+          Praxistest:
+          1. Mulden -> Mulden suchen öffnen: nur ein Suchbereich.
+          2. Suche nach Muldennummer, Kunde und Baustelle prüfen.
+          3. Liste/Karte umschalten.
+          4. Auf Smartphone/Tablet Karte mit einem Finger verschieben.
+          5. Mit zwei Fingern hinein-/herauszoomen.
+          6. Marker müssen deutlich kleiner sein und nur die Muldennummer zeigen.
+          7. Marker antippen: erst dann Details + Navigation anzeigen.
+          8. "Alle Typen" und einzelnen Muldentyp prüfen.
+          9. Einzelne Mulde über Suchfeld auswählen/eingrenzen.
+          10. Offline-/Reconnect-Test aus 036D stichprobenartig gegenprüfen.
+          TXT
+
+          cat > artifact/DISPOLUX_THEMENREGISTER_ERGAENZUNG_038A.csv <<'CSV'
+          Bereich;Änderung;Build;Status
+          Mulden suchen;Bestehende Suche und Kartenansicht zu einem Bereich zusammengeführt;DLB-038A;Umgesetzt
+          Mulden suchen;Doppelte Mulden-suchen-Überschrift entfernt;DLB-038A;Umgesetzt
+          Muldenkarte;Touch-Pan und Pinch-to-Zoom ergänzt;DLB-038A;Umgesetzt
+          Muldenkarte;Kompakte Marker nur mit Muldennummer;DLB-038A;Umgesetzt
+          Muldenkarte;Details erst nach Marker-Antippen;DLB-038A;Umgesetzt
+          Muldenkarte;Suche und Typfilter gemeinsam wirksam;DLB-038A;Umgesetzt
+          CSV
+
+          echo '038A: Produktions-JS syntaktisch gültig; integrierte mobile Muldenkarte und 037E-Basis geprüft.'
+
+      - name: Upload DLB-038A artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-038A-1.16.0.27-MULDEN-SUCHE-KARTE-TOUCH-SPFX-1.3.6.121
+          path: artifact/
+          if-no-files-found: error
