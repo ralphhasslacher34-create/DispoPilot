@@ -1,0 +1,456 @@
+name: DLB-041I-1.16.0.41 AUFTRAGSDETAIL 041C BASIS + WIEGEDATEN ONLY
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact successful DLB-041C workflow commit
+        uses: actions/checkout@v4
+        with:
+          ref: 303a57617abc7d59ee7b115a9a761808f05bf0df
+
+      - name: Preserve exact DLB-041C workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .github/workflows/DLB-041C-1.16.0.35_AUFTRAGSDETAIL_KACHELN_PLAYER_ZUSATZDATEN_FULL_BUILD.yml /tmp/DLB-041C-source.yml
+          test -s /tmp/DLB-041C-source.yml
+
+      - name: Checkout exact DLB-040C base used by successful 041C
+        uses: actions/checkout@v4
+        with:
+          ref: 339aae6dd0190e24a1534c6383d327de665dfccb
+          clean: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Rebuild and validate exact successful DLB-041C source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY_REBUILD_041C'
+          from pathlib import Path
+          import subprocess, yaml, json
+
+          expected_base='339aae6dd0190e24a1534c6383d327de665dfccb'
+          actual=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          if actual!=expected_base:
+              raise SystemExit(f'041I: falscher 040C-Basischeckout {actual}, erwartet {expected_base}.')
+
+          wf=Path('/tmp/DLB-041C-source.yml')
+          if not wf.exists():
+              raise SystemExit('041I: gesicherter 041C-Workflow fehlt.')
+          doc=yaml.safe_load(wf.read_text(encoding='utf-8'))
+          runs=[(s.get('name',''),s.get('run')) for s in doc['jobs']['build']['steps'] if s.get('run')]
+          expected_names=[
+              'Rebuild exact successful DLB-040C source basis',
+              'Apply DLB-041C tiled order detail',
+              'Validate DLB-041C source before build',
+              'Build and package DLB-041C',
+              'Validate emitted DLB-041C package'
+          ]
+          names=[n for n,_ in runs]
+          if names!=expected_names:
+              raise SystemExit('041I: 041C-Workflowstruktur weicht vom erfolgreichen Stand ab: '+repr(names))
+
+          for idx,(name,script) in enumerate(runs[:3],1):
+              print(f'===== 041I nutzt erfolgreichen 041C-Quellschritt {idx}/3: {name} =====')
+              runner=Path(f'.041h_041c_step_{idx}.sh')
+              runner.write_text(script,encoding='utf-8',newline='\n')
+              try:
+                  subprocess.run(['bash','-euo','pipefail',str(runner)],check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+
+          pkg=Path('spfx-build/config/package-solution.json')
+          if not pkg.exists():
+              raise SystemExit('041I: 041C-Rebuild hat spfx-build nicht erzeugt.')
+          data=json.loads(pkg.read_text(encoding='utf-8'))
+          if data.get('solution',{}).get('version')!='1.3.6.129':
+              raise SystemExit('041I: rekonstruierte 041C-SPFx-Version ist nicht 1.3.6.129.')
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          hits=[]
+          for p in files:
+              src=p.read_text(encoding='utf-8')
+              if '__DISPOLUX_041C' in src and "version:'1.16.0.35'" in src and 'DP_DLB_041C_1_16_0_35_AUFTRAGSDETAIL_KACHELN_PLAYER_ZUSATZDATEN_BEGIN' in src:
+                  hits.append((p,src))
+          if len(hits)!=1:
+              raise SystemExit(f'041I: rekonstruierte 041C-Runtime {len(hits)}x statt genau 1x gefunden.')
+          runtime,src=hits[0]
+          if any(x in src for x in ['__DISPOLUX_041D','__DISPOLUX_041E','__DISPOLUX_041F','__DISPOLUX_041G']):
+              raise SystemExit('041I: Basis enthält unerwartet einen späteren 041-Build.')
+
+          print('041I BASIS OK: exakter erfolgreicher DLB-041C-Quellstand rekonstruiert und validiert.')
+          PY_REBUILD_041C
+
+      - name: Apply DLB-041I weight-only correction on 041C
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH_041I'
+          from pathlib import Path
+          import json, subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          hits=[]
+          for p in files:
+              src=p.read_text(encoding='utf-8')
+              if '__DISPOLUX_041C' in src and "version:'1.16.0.35'" in src and 'DP_DLB_041C_1_16_0_35_AUFTRAGSDETAIL_KACHELN_PLAYER_ZUSATZDATEN_BEGIN' in src:
+                  hits.append((p,src))
+          if len(hits)!=1:
+              raise SystemExit(f'041I: 041C-Runtime {len(hits)}x statt genau 1x gefunden.')
+          runtime,src=hits[0]
+
+          if '__DISPOLUX_041I' in src:
+              raise SystemExit('041I: Patch bereits vorhanden.')
+          if any(x in src for x in ['__DISPOLUX_041D','__DISPOLUX_041E','__DISPOLUX_041F','__DISPOLUX_041G']):
+              raise SystemExit('041I: falsche Zwischenbasis erkannt.')
+
+          mstart=src.find('function dp41MountStatusFields(){')
+          mend=src.find('function dp41MaterialOptions(',mstart)
+          if mstart<0 or mend<=mstart or src.count('function dp41MountStatusFields(){')!=1:
+              raise SystemExit('041I: 041C-Mountfunktion nicht eindeutig gefunden.')
+
+          mount_block=r"""function dp41StatusGrid(){
+            const target=document.getElementById('dp41ExtraFields');if(!target)return null;
+            let grid=document.getElementById('dp41StatusFieldGrid');
+            if(!grid){grid=document.createElement('div');grid.id='dp41StatusFieldGrid';grid.className='form';target.prepend(grid);}
+            return grid;
+          }
+          function dp41MountStatusFields(){
+            const target=document.getElementById('dp41ExtraFields'),grid=dp41StatusGrid();if(!target||!grid)return;
+            const source=document.querySelector('#statusModal .form');
+            if(source){
+              Array.from(source.children).forEach(child=>{
+                if(child.id==='reasonField')child.classList.add('hidden');
+                grid.appendChild(child);
+              });
+            }
+            ['dpA3ConfirmBins','dpStatusWarehouseWrap','dpBTCompletionFields'].forEach(id=>{
+              const node=document.getElementById(id);if(node&&node.parentElement!==grid)grid.appendChild(node);
+            });
+            const note=document.getElementById('statusNote')?.parentElement;if(note&&note.parentElement!==target){note.classList.add('dp41ExtraBlock');target.appendChild(note);}
+            const disposed=document.getElementById('statusDisposed')?.closest('.switchline');if(disposed&&disposed.parentElement!==target&&disposed.parentElement?.id!=='dp41DisposedBlock'){
+              const helper=disposed.nextElementSibling,wrap=document.createElement('div');wrap.id='dp41DisposedBlock';wrap.className='dp41ExtraBlock';disposed.before(wrap);wrap.appendChild(disposed);if(helper&&helper.classList.contains('small'))wrap.appendChild(helper);target.appendChild(wrap);
+            }
+            const reason=document.getElementById('reasonField');if(reason)reason.classList.add('hidden');
+            const oldBtn=Array.from(document.querySelectorAll('#statusModal button')).find(b=>/Status speichern/i.test(dp41Text(b.textContent)));if(oldBtn)oldBtn.style.display='none';
+          }
+          function dp41ScheduleStatusMount(){[0,40,120,260].forEach(ms=>setTimeout(()=>{dp41MountStatusFields();dp41ApplyTimePolicy();},ms));}
+          const dp41Wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+
+          """
+          src=src[:mstart]+mount_block+src[mend:]
+
+          pstart=src.find('function dp41PrepareCompletion(o){')
+          pend=src.find('function dp41OpenExtra(){',pstart)
+          if pstart<0 or pend<=pstart or src.count('function dp41PrepareCompletion(o){')!=1:
+              raise SystemExit('041I: 041C-Abschlussvorbereitung nicht eindeutig gefunden.')
+
+          prepare_block=r"""async function dp41PrepareCompletion(o){
+            if(!o||!dp41BaseSetStatus)return false;
+            dp41InstallExtraModal();dp41BaseSetStatus('Ausgeführt');
+            closeM('statusModal');openM('detailModal');
+            dp41MountStatusFields();dp41ScheduleStatusMount();
+            await dp41Wait(280);dp41MountStatusFields();dp41ApplyTimePolicy();
+            const t=dp41AutoTimes(o),st=document.getElementById('statusStart'),en=document.getElementById('statusEnd'),pa=document.getElementById('statusPause');
+            if(st&&!st.value&&t.first)st.value=dp41Clock(t.first);if(en&&!en.value)en.value=dp41NowTime();if(pa&&!pa.value)pa.value=dp41Hm(t.pause);
+            dp41RenderPlannedMaterials(o);return true;
+          }
+          """
+          src=src[:pstart]+prepare_block+src[pend:]
+
+          old_open="function dp41OpenExtra(){const o=orderById(currentOrderId);if(!o)return;if(dp41PrepareCompletion(o))openM('dp41ExtraModal');}"
+          new_open="async function dp41OpenExtra(){const o=orderById(currentOrderId);if(!o)return;if(await dp41PrepareCompletion(o))openM('dp41ExtraModal');}"
+          if src.count(old_open)!=1:
+              raise SystemExit(f'041I: 041C-Zusatzdaten-Öffner {src.count(old_open)}x statt 1x.')
+          src=src.replace(old_open,new_open,1)
+
+          save_marker='async function dp41SaveExtra(){'
+          if src.count(save_marker)!=1:
+              raise SystemExit('041I: dp41SaveExtra nicht eindeutig gefunden.')
+          helper_block=r"""function dp41ParseWeightKg(value,unit='kg'){
+            let raw=dp41Text(value).replace(/\s/g,''),norm=raw;
+            if(raw.includes(','))norm=raw.replace(/\./g,'').replace(',','.');
+            let n=Number(norm);if(!Number.isFinite(n)||n<0)n=0;
+            return unit==='t'?Math.round(n*1000):Math.round(n);
+          }
+          function dp41TransportLocation(id){return (state?.transportLocations||[]).find(x=>String(x.id)===String(id))||null;}
+          function dp41BtSnapshot(o){return {actualMaterial:dp41Text(o?.actualMaterial||o?.material||''),netWeightKg:Number(o?.netWeightKg||0),actualDropLocationId:dp41Text(o?.actualDropLocationId),actualDropLocationName:dp41Text(o?.actualDropLocationName)};}
+          function dp41SaveBtFields(o){
+            if(!o)return;
+            const mat=document.getElementById('dpBTActualMaterial'),weight=document.getElementById('dpBTWeight'),unit=document.getElementById('dpBTWeightUnit'),dest=document.getElementById('dpBTActualDest');
+            if(mat)o.actualMaterial=dp41Text(mat.value)||dp41Text(o.material);
+            if(weight)o.netWeightKg=dp41ParseWeightKg(weight.value,dp41Text(unit?.value)||'kg');
+            if(dest){const id=dp41Text(dest.value),loc=dp41TransportLocation(id);o.actualDropLocationId=id;o.actualDropLocationName=dp41Text(loc?.name)||(id?dp41Text(o.actualDropLocationName||o.unloadLocationName||o.drop):'');}
+          }
+          function dp41AuditBtChange(o,before,after){
+            if(JSON.stringify(before)===JSON.stringify(after))return;
+            if(!Array.isArray(o.btChanges))o.btChanges=[];
+            o.btChanges.push({at:dp41NowIso(),by:dp41Text(state?.user?.name||window.DP_AUTH?.displayName||''),kind:'Zusatzdaten geändert',before,after});
+            if(o.btChanges.length>200)o.btChanges=o.btChanges.slice(-200);
+          }
+
+          """
+          idx=src.find(save_marker)
+          src=src[:idx]+helper_block+src[idx:]
+
+          old_before="const before={start:o.start||'',end:o.end||'',pause:o.pause||''};"
+          new_before="const before={start:o.start||'',end:o.end||'',pause:o.pause||''},btBefore=dp41BtSnapshot(o);"
+          if src.count(old_before)!=1:
+              raise SystemExit(f'041I: Save-Before {src.count(old_before)}x statt 1x.')
+          src=src.replace(old_before,new_before,1)
+
+          old_save='dp41SavePlanned(o);'
+          new_save='dp41SavePlanned(o);dp41SaveBtFields(o);const btAfter=dp41BtSnapshot(o);dp41AuditBtChange(o,btBefore,btAfter);'
+          if src.count(old_save)!=1:
+              raise SystemExit(f'041I: SavePlanned {src.count(old_save)}x statt 1x.')
+          src=src.replace(old_save,new_save,1)
+
+          old_finish='if(!dp41PrepareCompletion(o))return;'
+          if src.count(old_finish)!=1:
+              raise SystemExit(f'041I: Finish-Vorbereitung {src.count(old_finish)}x statt 1x.')
+          src=src.replace(old_finish,'if(!await dp41PrepareCompletion(o))return;',1)
+
+          old_handler="root.querySelector('#dp41Extra')?.addEventListener('click',dp41OpenExtra);"
+          if src.count(old_handler)!=1:
+              raise SystemExit(f'041I: Zusatzdaten-Handler {src.count(old_handler)}x statt 1x.')
+          src=src.replace(old_handler,"root.querySelector('#dp41Extra')?.addEventListener('click',()=>void dp41OpenExtra());",1)
+
+          old_ls="<div class=\"dp41DataTile\"><span>LS-Nr.</span><strong>'+dp41Esc(o.lsNo||'–')+'</strong></div></div>'+"
+          new_ls="<div class=\"dp41DataTile\"><span>LS-Nr.</span><strong>'+dp41Esc(o.lsNo||'–')+'</strong></div>'+ \n      ((Number(o.netWeightKg||0)>0)?'<div class=\"dp41DataTile\"><span>Nettogewicht</span><strong>'+dp41Esc(Number(o.netWeightKg).toLocaleString('de-DE'))+' kg</strong></div>':'')+'</div>'+"
+          if src.count(old_ls)!=1:
+              raise SystemExit(f'041I: LS-Kachelanker {src.count(old_ls)}x statt 1x.')
+          src=src.replace(old_ls,new_ls,1)
+
+          end_marker='/* DP_DLB_041C_1_16_0_35_AUFTRAGSDETAIL_KACHELN_PLAYER_ZUSATZDATEN_END */'
+          if src.count(end_marker)!=1:
+              raise SystemExit('041I: 041C-Endmarker nicht eindeutig.')
+          marker=r"""
+          /* DP_DLB_041I_1_16_0_41_WEIGHT_ONLY_BEGIN */
+          try{Object.defineProperty(window,'__DISPOLUX_041I',{value:{
+            version:'1.16.0.41',
+            base:'DLB-041C-1.16.0.35',
+            scope:'weight-only',
+            weightFields:'existing-dpBTCompletionFields'
+          },configurable:true});}catch(_){}
+          /* DP_DLB_041I_1_16_0_41_WEIGHT_ONLY_END */
+          """
+          src=src.replace(end_marker,end_marker+'\n'+marker,1)
+
+          runtime.write_text(src,encoding='utf-8',newline='\n')
+          if runtime.suffix=='.js':
+              subprocess.run(['node','--check',str(runtime)],check=True)
+
+          pkg=Path('spfx-build/config/package-solution.json')
+          data=json.loads(pkg.read_text(encoding='utf-8'))
+          old=data.get('solution',{}).get('version')
+          if old!='1.3.6.129':
+              raise SystemExit(f'041I: erwartete 041C-SPFx-Version 1.3.6.129, gefunden {old!r}.')
+          data['solution']['version']='1.3.6.135'
+          pkg.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+
+          print('041I WEIGHT-ONLY PATCH OK:',runtime)
+          PY_PATCH_041I
+
+      - name: Validate DLB-041I source before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VALIDATE_041I'
+          from pathlib import Path
+          import json, subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          hits=[];combined=[]
+          for p in files:
+              src=p.read_text(encoding='utf-8');combined.append(src)
+              if '__DISPOLUX_041I' in src:hits.append((p,src))
+          if len(hits)!=1:
+              raise SystemExit(f'041I VALIDIERUNG: Patch {len(hits)}x statt genau 1x gefunden.')
+          runtime,src=hits[0]
+          all_text='\n'.join(combined)
+
+          required_041c=[
+              '__DISPOLUX_041C',"version:'1.16.0.35'",'tile-detail-v2',
+              'workSegments','workEvents','workTimeCorrections',
+              'dp41QuickStart','dp41QuickPause','dp41Finish','dp41OpenExtra',
+              'plannedBinMaterials','actualBinMaterials','actualExistingBinMaterials',
+              'Systemstandort','GPS-Standort','Zusatzinformation · bereits an der Baustelle',
+              'DispoLux:036D:offlineOutbox:v1','avvMaterialCatalog-via-dpR1MaterialOptions'
+          ]
+          missing=[x for x in required_041c if x not in all_text]
+          if missing:
+              raise SystemExit('041I VALIDIERUNG: 041C-Basis fehlt: '+', '.join(missing))
+
+          required_fix=[
+              '__DISPOLUX_041I',"version:'1.16.0.41'","base:'DLB-041C-1.16.0.35'","scope:'weight-only'",
+              'dp41StatusFieldGrid',"const source=document.querySelector('#statusModal .form')",
+              "['dpA3ConfirmBins','dpStatusWarehouseWrap','dpBTCompletionFields']",
+              'dp41ScheduleStatusMount','await dp41Wait(280)',
+              'async function dp41OpenExtra','await dp41PrepareCompletion(o)',
+              'dp41ParseWeightKg','dp41SaveBtFields','dp41AuditBtChange','dp41BtSnapshot',
+              'dpBTActualMaterial','dpBTWeight','dpBTWeightUnit','dpBTActualDest',
+              'netWeightKg','actualDropLocationId','actualDropLocationName','btChanges','Nettogewicht',
+              'dp41SavePlanned(o);dp41SaveBtFields(o)'
+          ]
+          missing=[x for x in required_fix if x not in src]
+          if missing:
+              raise SystemExit('041I VALIDIERUNG: Wiegedaten-Fix fehlt: '+', '.join(missing))
+
+          forbidden=[
+              '__DISPOLUX_041D','__DISPOLUX_041E','__DISPOLUX_041F','__DISPOLUX_041G',
+              'target.appendChild(form)',
+              "if(!dp41PrepareCompletion(o))return;",
+              "addEventListener('click',dp41OpenExtra)"
+          ]
+          present=[x for x in forbidden if x in src]
+          if present:
+              raise SystemExit('041I VALIDIERUNG: unerlaubte/alte Logik vorhanden: '+', '.join(present))
+
+          if src.count('DP_DLB_041I_1_16_0_41_WEIGHT_ONLY_BEGIN')!=1 or src.count('DP_DLB_041I_1_16_0_41_WEIGHT_ONLY_END')!=1:
+              raise SystemExit('041I VALIDIERUNG: 041I-Marker nicht eindeutig.')
+
+          pkg=json.loads(Path('spfx-build/config/package-solution.json').read_text(encoding='utf-8'))
+          if pkg.get('solution',{}).get('version')!='1.3.6.135':
+              raise SystemExit('041I VALIDIERUNG: SPFx-Version ist nicht 1.3.6.135.')
+
+          if runtime.suffix=='.js':
+              subprocess.run(['node','--check',str(runtime)],check=True)
+
+          print('041I QUELLVALIDIERUNG OK')
+          print('- Basis weiterhin DLB-041C / 1.16.0.35')
+          print('- nur Wiege-/Abschlussdaten-Anbindung geändert')
+          print('- D/E/F/G nicht enthalten')
+          PY_VALIDATE_041I
+
+      - name: Build and package DLB-041I
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf spfx-build/release spfx-build/temp/deploy spfx-build/sharepoint/solution
+          (cd spfx-build && npx heft build --production)
+          (cd spfx-build && npx heft package-solution --production)
+
+          rm -rf artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n1)
+          test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          if [ -d spfx-build/release/assets ]; then
+            cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d spfx-build/temp/deploy ]; then
+            cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else
+            echo '041I: Keine SPFx Asset-Ausgabe gefunden.' >&2
+            exit 1
+          fi
+
+      - name: Validate emitted DLB-041I package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COUNT=0
+          while IFS= read -r -d '' JS; do
+            test -s "$JS"
+            node --check "$JS"
+            COUNT=$((COUNT+1))
+          done < <(find artifact/UPLOAD_TO_SITEASSETS -maxdepth 1 -type f -name '*.js' -print0)
+          test "$COUNT" -gt 0
+          test -s artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          python3 - <<'PY_FINAL_041I'
+          from pathlib import Path
+
+          js=list(Path('artifact/UPLOAD_TO_SITEASSETS').glob('*.js'))
+          hits=[]
+          for p in js:
+              src=p.read_text(encoding='utf-8')
+              if '__DISPOLUX_041I' in src and '1.16.0.41' in src:
+                  hits.append((p,src))
+          if len(hits)!=1:
+              raise SystemExit(f'041I FINAL: Produktionsbundle {len(hits)}x statt genau 1x.')
+
+          p,src=hits[0]
+          # Final bundles are minified: verify stable runtime/data/DOM markers,
+          # never private helper function names such as dp41SaveBtFields.
+          required=[
+              '__DISPOLUX_041C','1.16.0.35','__DISPOLUX_041I','1.16.0.41',
+              'dp41StatusFieldGrid','dpBTCompletionFields','dpBTActualMaterial','dpBTWeight','dpBTWeightUnit','dpBTActualDest',
+              'netWeightKg','actualDropLocationId','btChanges','Nettogewicht',
+              'existing-dpBTCompletionFields',
+              'workSegments','workEvents','workTimeCorrections',
+              'plannedBinMaterials','actualBinMaterials','actualExistingBinMaterials',
+              'DispoLux:036D:offlineOutbox:v1','avvMaterialCatalog-via-dpR1MaterialOptions',
+              'Systemstandort','GPS-Standort'
+          ]
+          missing=[x for x in required if x not in src]
+          if missing:
+              raise SystemExit('041I FINAL fehlt: '+', '.join(missing))
+
+          forbidden=['__DISPOLUX_041D','__DISPOLUX_041E','__DISPOLUX_041F','__DISPOLUX_041G']
+          bad=[x for x in forbidden if x in src]
+          if bad:
+              raise SystemExit('041I FINAL enthält falsche Zwischenbuilds: '+', '.join(bad))
+
+          print('041I PAKETVALIDIERUNG OK:',p.name)
+          PY_FINAL_041I
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DLB-041I-1.16.0.41 · 041C BASIS + WIEGEDATEN ONLY + FINAL VALIDATOR FIX · SPFx 1.3.6.135
+
+          Verbindliche Basis:
+          - exakt erfolgreicher DLB-041C / Produkt 1.16.0.35 / SPFx 1.3.6.129
+          - 041C wird aus seinem erfolgreichen Workflowstand rekonstruiert und vor 041I erneut validiert
+          - DLB-041D / 041E / 041F / 041G sind KEINE Basis und dürfen im Produktionsbundle nicht enthalten sein
+
+          Einzige fachliche Änderung gegenüber 041C:
+          - vorhandene dynamische Betriebstagebuch/eANV-Abschlussfelder bleiben funktionsfähig
+          - dpBTCompletionFields wird in „Zusatzdaten“ übernommen
+          - tatsächliches Material, Nettogewicht (kg/t) und tatsächlicher Abladeort werden dort angezeigt/gespeichert
+          - vorhandene Datenfelder netWeightKg / actualDropLocationId / actualDropLocationName werden weiterverwendet
+          - gespeichertes Nettogewicht erscheint zusätzlich in der Auftragsdaten-Kachel
+          - Änderungen an diesen Wiege-/Abfalldaten werden in btChanges protokolliert
+
+          Unverändert aus 041C:
+          - Kachelansicht und Player Start/Pause/Weiter
+          - Zeitmodell und Zeitkorrekturen
+          - Mulden-/Materiallogik
+          - GPS/Systemstandort
+          - Rapport / Auftrag bearbeiten / Auftrag übernehmen / Nicht ausgeführt
+          - Offline-Outbox und bestehende Recovery-Basis
+
+          Pflicht-Praxistest nach grünem Build:
+          1. 041C-Oberfläche optisch/funktional gegenprüfen.
+          2. Zusatzdaten öffnen: bisherige Felder müssen weiterhin vorhanden sein.
+          3. Bei relevantem Entsorgungs-/Abschlussvorgang müssen Gewicht/Einheit und vorhandene BT-Felder sichtbar sein.
+          4. Gewicht in kg speichern, Zusatzdaten schließen/öffnen: Wert muss erhalten bleiben.
+          5. Gewicht in t speichern: Speicherung muss korrekt als netWeightKg erfolgen.
+          6. Auftrag ausführen und erneut öffnen/Archiv prüfen: Nettogewicht muss erhalten bleiben.
+          7. Abholen/Leeren/Tauschen: Ist-Material und Ziel-Lager/Abladeort gegenprüfen.
+          8. Start/Pause/Weiter, Rapport, GPS und Offline-Verhalten auf Regression prüfen.
+          TXT
+
+      - name: Upload DLB-041I artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-041I-1.16.0.41-041C-BASIS-WIEGEDATEN-ONLY-SPFX-1.3.6.135
+          path: artifact/
+          if-no-files-found: error
