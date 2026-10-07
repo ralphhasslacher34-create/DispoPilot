@@ -1,0 +1,208 @@
+name: DLB-041E-1.16.0.37 AUFTRAGSDETAIL KACHELN PLAYER ZUSATZDATEN WIEGEDATEN KORREKTURBUILD
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout current workflow source
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: workflow-source
+
+      - name: Checkout exact successful DLB-040C base
+        uses: actions/checkout@v4
+        with:
+          ref: 339aae6dd0190e24a1534c6383d327de665dfccb
+          path: work
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Prepare and preflight DLB-041E correction
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY_PREPARE_041E'
+          from pathlib import Path
+          import base64, re, textwrap, yaml
+
+          source = Path('workflow-source/.github/workflows/DLB-041D-1.16.0.36_AUFTRAGSDETAIL_KACHELN_PLAYER_ZUSATZDATEN_WIEGEDATEN_FULL_BUILD.yml')
+          if not source.exists():
+              raise SystemExit(f'041E: Quellworkflow fehlt: {source}')
+
+          doc = yaml.safe_load(source.read_text(encoding='utf-8'))
+          steps = doc['jobs']['build']['steps']
+          by_name = {s.get('name',''): s.get('run') for s in steps if s.get('run')}
+
+          wanted = {
+              '01_base.sh': 'Rebuild exact successful DLB-040C source basis',
+              '02_apply.sh': 'Apply DLB-041D tiled order detail',
+              '03_validate.sh': 'Validate DLB-041D source before build',
+              '04_build.sh': 'Build and package DLB-041D',
+              '05_final.sh': 'Validate emitted DLB-041D package',
+          }
+          missing = [name for name in wanted.values() if name not in by_name]
+          if missing:
+              raise SystemExit('041E: Schritte im 041D-Workflow fehlen: ' + ', '.join(missing))
+
+          def rename_plain(s: str) -> str:
+              # Erst die spezifischen Marker, dann Bezeichner/Versionen.
+              s = s.replace('_1_16_0_35_', '_1_16_0_37_')
+              s = s.replace('_1_16_0_36_', '_1_16_0_37_')
+              s = s.replace('1.16.0.36', '1.16.0.37')
+              s = s.replace('1.3.6.130', '1.3.6.131')
+              s = s.replace('041D', '041E')
+              return s
+
+          apply_original = by_name['Apply DLB-041D tiled order detail']
+          block_re = re.compile(
+              r"cat > /tmp/dlb041d_patch\.b64 <<'DLB041D_PATCH'\n"
+              r"(?P<body>.*?)\n"
+              r"\s*DLB041D_PATCH",
+              re.S
+          )
+          match = block_re.search(apply_original)
+          if not match:
+              raise SystemExit('041E: Base64-Patchblock im 041D-Workflow nicht gefunden.')
+
+          raw_b64 = ''.join(line.strip() for line in match.group('body').splitlines())
+          try:
+              payload = base64.b64decode(raw_b64).decode('utf-8')
+          except Exception as exc:
+              raise SystemExit(f'041E: 041D-Patch lässt sich nicht dekodieren: {exc}')
+
+          payload = rename_plain(payload)
+
+          begin = 'DP_DLB_041E_1_16_0_37_AUFTRAGSDETAIL_KACHELN_PLAYER_ZUSATZDATEN_BEGIN'
+          end = 'DP_DLB_041E_1_16_0_37_AUFTRAGSDETAIL_KACHELN_PLAYER_ZUSATZDATEN_END'
+          if payload.count(begin) != 1 or payload.count(end) != 1:
+              raise SystemExit(
+                  f'041E PRECHECK: interner Patchmarker falsch: BEGIN={payload.count(begin)}, END={payload.count(end)}'
+              )
+          if 'DP_DLB_041D_' in payload or '1.16.0.36' in payload:
+              raise SystemExit('041E PRECHECK: alter 041D-/1.16.0.36-Marker steckt noch im Patch.')
+          if "version:'1.16.0.37'" not in payload:
+              raise SystemExit('041E PRECHECK: Runtime-Version 1.16.0.37 fehlt im Patch.')
+          if '__DISPOLUX_041E' not in payload:
+              raise SystemExit('041E PRECHECK: Runtime-Kennung __DISPOLUX_041E fehlt im Patch.')
+
+          wrapped = '\n'.join(textwrap.wrap(base64.b64encode(payload.encode('utf-8')).decode('ascii'), 100))
+          replacement = "cat > /tmp/dlb041d_patch.b64 <<'DLB041D_PATCH'\n" + wrapped + "\n          DLB041D_PATCH"
+          apply_with_payload = block_re.sub(replacement, apply_original, count=1)
+
+          scripts = {
+              '01_base.sh': rename_plain(by_name[wanted['01_base.sh']]),
+              '02_apply.sh': rename_plain(apply_with_payload),
+              '03_validate.sh': rename_plain(by_name[wanted['03_validate.sh']]),
+              '04_build.sh': rename_plain(by_name[wanted['04_build.sh']]),
+              '05_final.sh': rename_plain(by_name[wanted['05_final.sh']]),
+          }
+
+          # Harte Vorprüfung des erzeugten 041E-Builds.
+          joined = '\n'.join(scripts.values())
+          forbidden = [
+              'DP_DLB_041D_1_16_0_35_',
+              'DP_DLB_041D_1_16_0_36_',
+              '1.16.0.36',
+              '1.3.6.130',
+          ]
+          leftovers = [x for x in forbidden if x in joined]
+          if leftovers:
+              raise SystemExit('041E PRECHECK: alte Werte übrig: ' + ', '.join(leftovers))
+
+          apply_script = scripts['02_apply.sh']
+          validate_script = scripts['03_validate.sh']
+          final_script = scripts['05_final.sh']
+
+          required_apply = [
+              "marker='DP_DLB_041E_1_16_0_37_AUFTRAGSDETAIL_KACHELN_PLAYER_ZUSATZDATEN_BEGIN'",
+              "data['solution']['version']='1.3.6.131'",
+              "old!='1.3.6.126'",
+          ]
+          required_validate = [
+              "begin='DP_DLB_041E_1_16_0_37_AUFTRAGSDETAIL_KACHELN_PLAYER_ZUSATZDATEN_BEGIN'",
+              "end='DP_DLB_041E_1_16_0_37_AUFTRAGSDETAIL_KACHELN_PLAYER_ZUSATZDATEN_END'",
+              "version:'1.16.0.37'",
+              "get('version')!='1.3.6.131'",
+          ]
+          required_final = [
+              '__DISPOLUX_041E',
+              '1.16.0.37',
+          ]
+
+          for token in required_apply:
+              if token not in apply_script:
+                  raise SystemExit('041E PRECHECK Apply fehlt: ' + token)
+          for token in required_validate:
+              if token not in validate_script:
+                  raise SystemExit('041E PRECHECK Validate fehlt: ' + token)
+          for token in required_final:
+              if token not in final_script:
+                  raise SystemExit('041E PRECHECK Final fehlt: ' + token)
+
+          out = Path('work/.041e_scripts')
+          out.mkdir(parents=True, exist_ok=True)
+          for filename, script in scripts.items():
+              p = out / filename
+              p.write_text(script, encoding='utf-8', newline='\n')
+              p.chmod(0o755)
+
+          print('041E PRECHECK OK')
+          print('- 041D-Quellworkflow wurde gelesen, nicht manuell nachgebaut.')
+          print('- interner Patchmarker: 041E / 1.16.0.37 eindeutig')
+          print('- SPFx-Zielversion: 1.3.6.131')
+          print('- die drei falschen 041D-Prüfmarker aus 041D sind beseitigt')
+          print('- Build-, Quell- und Paketvalidierung bleiben erhalten')
+          PY_PREPARE_041E
+
+      - name: Rebuild exact successful DLB-040C source basis
+        shell: bash
+        working-directory: work
+        run: |
+          set -euo pipefail
+          bash .041e_scripts/01_base.sh
+
+      - name: Apply DLB-041E corrected tiled order detail
+        shell: bash
+        working-directory: work
+        run: |
+          set -euo pipefail
+          bash .041e_scripts/02_apply.sh
+
+      - name: Validate DLB-041E source before build
+        shell: bash
+        working-directory: work
+        run: |
+          set -euo pipefail
+          bash .041e_scripts/03_validate.sh
+
+      - name: Build and package DLB-041E
+        shell: bash
+        working-directory: work
+        run: |
+          set -euo pipefail
+          bash .041e_scripts/04_build.sh
+
+      - name: Validate emitted DLB-041E package
+        shell: bash
+        working-directory: work
+        run: |
+          set -euo pipefail
+          bash .041e_scripts/05_final.sh
+
+      - name: Upload DLB-041E artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-041E-1.16.0.37-AUFTRAGSDETAIL-KACHELN-PLAYER-ZUSATZDATEN-WIEGEDATEN-SPFX-1.3.6.131
+          path: work/artifact/
+          if-no-files-found: error
