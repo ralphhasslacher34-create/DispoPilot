@@ -1,0 +1,322 @@
+name: DLB-039C-1.16.0.30 MATERIAL STAMM FELDER REGRESSION FIX FULL BUILD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Rebuild exact DLB-039B source basis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY_RUN_039B_BASE'
+          from pathlib import Path
+          import subprocess, yaml
+
+          wf=Path('.github/workflows/DLB-039B-1.16.0.29_RECOVERY_DIRECT_SAFETY_BACKUP_FULL_BUILD.yml')
+          if not wf.exists():
+              raise SystemExit('039C: DLB-039B-Workflow fehlt im Repository.')
+          doc=yaml.safe_load(wf.read_text(encoding='utf-8'))
+          runs=[(s.get('name',''),s.get('run')) for s in doc['jobs']['build']['steps'] if s.get('run')]
+          if len(runs)!=5:
+              raise SystemExit(f'039C: 039B erwartet 5 ausführbare Buildschritte, gefunden {len(runs)}.')
+          for idx,(name,script) in enumerate(runs[:2],1):
+              print(f'===== 039C Basis 039B Schritt {idx}/2: {name} =====')
+              runner=Path(f'.039c_039b_step_{idx}.sh')
+              runner.write_text(script,encoding='utf-8',newline='\n')
+              try:
+                  subprocess.run(['bash','-euo','pipefail',str(runner)],check=True)
+              finally:
+                  runner.unlink(missing_ok=True)
+          print('039C: DLB-039B-Quellstand rekonstruiert.')
+          PY_RUN_039B_BASE
+
+      - name: Repair material master source and restore fields
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH_039C'
+          from pathlib import Path
+          import json, subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          base039b='DP_DLB_039B_1_16_0_28_RECOVERY_PRE_CLEAN_BEGIN'
+          base035b='DP_DLB_035B_1_16_0_16_AUFTRAG_KONTAKT_MEHRMULDEN_MATERIAL_BEGIN'
+          begin='DP_DLB_039C_1_16_0_30_MATERIAL_STAMM_FELDER_FIX_BEGIN'
+          end='DP_DLB_039C_1_16_0_30_MATERIAL_STAMM_FELDER_FIX_END'
+          end_marker='/* DP13_PATCH_END */'
+
+          hits=[]
+          for p in files:
+              s=p.read_text(encoding='utf-8')
+              if base039b in s and base035b in s and end_marker in s:
+                  hits.append((p,s))
+          if len(hits)!=1:
+              raise SystemExit(f'039C: App-Runtime {len(hits)}x statt genau 1x gefunden.')
+          runtime,src=hits[0]
+          if begin in src:
+              raise SystemExit('039C: Patch bereits vorhanden.')
+          if 'function dpR1MaterialOptions' not in src:
+              raise SystemExit('039C: ursprüngliche Materialoptions-Funktion fehlt.')
+
+          # 1) 035B-Materialauswahl wieder an die ursprüngliche Optionsquelle binden.
+          mstart=src.find('function dp35MaterialRows(){')
+          mend=src.find('function dp35PlannedFromOrder(',mstart)
+          if mstart<0 or mend<0 or mend<=mstart:
+              raise SystemExit('039C: 035B-Materialoptionsblock nicht gefunden.')
+          oldblock=src[mstart:mend]
+          if '(state?.materials||[])' not in oldblock or 'function dp35MaterialOptions' not in oldblock:
+              raise SystemExit('039C: erwartete 035B-Fehlerstelle nicht eindeutig.')
+
+          replacement=r"""function dp39cMasterMaterialRows(selected=''){
+            const value=dp35Text(selected);
+            let html='';
+            if(typeof dpR1MaterialOptions==='function'){
+              const taskEl=$('oTask');
+              const beforeTask=taskEl?taskEl.value:null;
+              try{
+                // 033C leitet Stellen sonst auf die falsche state.materials-Liste um.
+                if(taskEl&&dp35Text(taskEl.value)==='Stellen')taskEl.value='Abholen';
+                html=String(dpR1MaterialOptions(value)||'');
+              }finally{
+                if(taskEl&&beforeTask!==null)taskEl.value=beforeTask;
+              }
+            }
+            const probe=document.createElement('select');
+            probe.innerHTML=html;
+            const seen=new Set();
+            const rows=[];
+            Array.from(probe.options||[]).forEach(opt=>{
+              const v=dp35Text(opt.value);
+              const label=dp35Text(opt.textContent||opt.label||v);
+              if(!v||v.toLocaleLowerCase('de')==='leer')return;
+              const key=v.toLocaleLowerCase('de');
+              if(seen.has(key))return;
+              seen.add(key);
+              rows.push({value:v,label:label||v});
+            });
+            if(value&&!seen.has(value.toLocaleLowerCase('de')))rows.push({value,label:value});
+            return rows;
+          }
+
+          function dp35MaterialRows(){
+            return dp39cMasterMaterialRows().map(x=>x.value);
+          }
+
+          function dp35MaterialOptions(selected='',emptyLabel='Leer'){
+            const value=dp35Text(selected);
+            const rows=dp39cMasterMaterialRows(value);
+            let html='<option value="">'+esc(emptyLabel)+'</option>';
+            html+=rows.map(x=>'<option value="'+esc(x.value)+'" '+(x.value===value?'selected':'')+'>'+esc(x.label)+'</option>').join('');
+            return html;
+          }
+
+          """
+          src=src[:mstart]+replacement+src[mend:]
+
+          # 2) 035B hatte das Materialfeld bei Tauschen/Abholen/Leeren versteckt.
+          old_hide="if(['Stellen','Liefern','Tauschen','Abholen','Leeren'].includes(task))globalMaterial?.classList.add('hidden');"
+          new_hide="""if(['Stellen','Liefern'].includes(task))globalMaterial?.classList.add('hidden');
+            else if(['Tauschen','Abholen','Leeren'].includes(task))globalMaterial?.classList.remove('hidden');"""
+          if src.count(old_hide)!=1:
+              raise SystemExit(f'039C: alte Ausblendelogik {src.count(old_hide)}x statt 1x.')
+          src=src.replace(old_hide,new_hide,1)
+
+          # 3) Beim Tauschen Alt-/Ist-Material nicht mehr mit Planmaterial der neuen Mulde überschreiben.
+          old_pre="""if(planned.length){
+              if($('oMaterial'))$('oMaterial').value=planned[0]||'';
+              if($('dpR1MaterialSelect'))$('dpR1MaterialSelect').value=planned[0]||'';
+            }"""
+          new_pre="""if(planned.length&&task!=='Tauschen'){
+              if($('oMaterial'))$('oMaterial').value=planned[0]||'';
+              if($('dpR1MaterialSelect'))$('dpR1MaterialSelect').value=planned[0]||'';
+            }"""
+          if src.count(old_pre)!=1:
+              raise SystemExit(f'039C: planned->material Block {src.count(old_pre)}x statt 1x.')
+          src=src.replace(old_pre,new_pre,1)
+
+          old_saved="saved.material=dp35Text(saved.plannedBinMaterials[0]);"
+          new_saved="if(saved.task!=='Tauschen')saved.material=dp35Text(saved.plannedBinMaterials[0]);"
+          if src.count(old_saved)!=1:
+              raise SystemExit(f'039C: saved.material Block {src.count(old_saved)}x statt 1x.')
+          src=src.replace(old_saved,new_saved,1)
+
+          marker=r"""
+          /* DP_DLB_039C_1_16_0_30_MATERIAL_STAMM_FELDER_FIX_BEGIN */
+          try{
+            Object.defineProperty(window,'__DISPOLUX_039C',{
+              value:{version:'1.16.0.30',materialMaster:'original-dpR1-options',restoredFields:['Tauschen','Abholen','Leeren']},
+              configurable:true
+            });
+          }catch(_){}
+          /* DP_DLB_039C_1_16_0_30_MATERIAL_STAMM_FELDER_FIX_END */
+          """
+          if src.count(end_marker)!=1:
+              raise SystemExit(f'039C: DP13-Endmarker {src.count(end_marker)}x statt 1x.')
+          src=src.replace(end_marker,marker+'\n\n'+end_marker,1)
+
+          runtime.write_text(src,encoding='utf-8',newline='\n')
+          if runtime.suffix=='.js':
+              subprocess.run(['node','--check',str(runtime)],check=True)
+
+          pkg=Path('spfx-build/config/package-solution.json')
+          data=json.loads(pkg.read_text(encoding='utf-8'))
+          if data.get('solution',{}).get('version')!='1.3.6.123':
+              raise SystemExit('039C: erwartete 039B-SPFx-Version 1.3.6.123 fehlt.')
+          data['solution']['version']='1.3.6.124'
+          pkg.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          print('039C: Materialquelle und Felder repariert.')
+          PY_PATCH_039C
+
+      - name: Validate 039C source before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VALIDATE_039C'
+          from pathlib import Path
+          import json, subprocess
+
+          root=Path('spfx-build/src/webparts')
+          files=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]
+          begin='DP_DLB_039C_1_16_0_30_MATERIAL_STAMM_FELDER_FIX_BEGIN'
+          hits=[]; combined=[]
+          for p in files:
+              s=p.read_text(encoding='utf-8'); combined.append(s)
+              if begin in s: hits.append((p,s))
+          if len(hits)!=1:
+              raise SystemExit(f'039C VALIDIERUNG: Patch {len(hits)}x statt 1x.')
+          runtime,src=hits[0]
+          all_text='\n'.join(combined)
+
+          required_basis=[
+              'DP_DLB_039B_1_16_0_28_RECOVERY_PRE_CLEAN_BEGIN',
+              'DP_DLB_036D_1_16_0_20_OFFLINE_OUTBOX_SYNC_BEGIN',
+              'DP_DLB_035B_1_16_0_16_AUFTRAG_KONTAKT_MEHRMULDEN_MATERIAL_BEGIN',
+              'plannedBinMaterials','actualBinMaterials','actualExistingBinMaterials',
+              'DispoLux:036D:offlineOutbox:v1'
+          ]
+          missing=[x for x in required_basis if x not in all_text]
+          if missing:
+              raise SystemExit('039C VALIDIERUNG Basis fehlt: '+', '.join(missing))
+
+          start=src.find('function dp39cMasterMaterialRows(')
+          stop=src.find('function dp35PlannedFromOrder(',start)
+          frag=src[start:stop] if start>=0 and stop>start else ''
+          required_fix=[
+              'dpR1MaterialOptions(value)',"taskEl.value='Abholen'",
+              "else if(['Tauschen','Abholen','Leeren'].includes(task))globalMaterial?.classList.remove('hidden');",
+              "if(planned.length&&task!=='Tauschen'){",
+              "if(saved.task!=='Tauschen')saved.material=dp35Text(saved.plannedBinMaterials[0]);",
+              "version:'1.16.0.30'"
+          ]
+          missing=[x for x in required_fix if x not in src]
+          if missing:
+              raise SystemExit('039C VALIDIERUNG Fix fehlt: '+', '.join(missing))
+          if '(state?.materials||[])' in frag:
+              raise SystemExit('039C VALIDIERUNG: falsche direkte state.materials-Quelle noch aktiv.')
+          if "if(['Stellen','Liefern','Tauschen','Abholen','Leeren'].includes(task))globalMaterial?.classList.add('hidden');" in src:
+              raise SystemExit('039C VALIDIERUNG: alte Ausblendelogik noch aktiv.')
+
+          pkg=json.loads(Path('spfx-build/config/package-solution.json').read_text(encoding='utf-8'))
+          if pkg.get('solution',{}).get('version')!='1.3.6.124':
+              raise SystemExit('039C VALIDIERUNG: SPFx-Version falsch.')
+          if runtime.suffix=='.js': subprocess.run(['node','--check',str(runtime)],check=True)
+
+          print('039C VALIDIERUNG OK')
+          print('- ursprüngliche Material-Stammdatenquelle wieder verwendet')
+          print('- Tauschen / Abholen / Leeren: Materialfeld wieder sichtbar')
+          print('- Tauschen: Alt-/Ist-Material bleibt getrennt vom Planmaterial')
+          PY_VALIDATE_039C
+
+      - name: Build and package 039C
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf spfx-build/release spfx-build/temp/deploy spfx-build/sharepoint/solution
+          (cd spfx-build && npx heft build --production)
+          (cd spfx-build && npx heft package-solution --production)
+          rm -rf artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          mkdir -p artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          PKG=$(find spfx-build/sharepoint/solution -maxdepth 1 -type f -name '*.sppkg' | head -n1)
+          test -n "$PKG"
+          cp "$PKG" artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+          if [ -d spfx-build/release/assets ]; then
+            cp -a spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d spfx-build/temp/deploy ]; then
+            cp -a spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else
+            echo '039C: Keine SPFx Asset-Ausgabe gefunden.' >&2
+            exit 1
+          fi
+
+      - name: Validate emitted 039C package
+        shell: bash
+        run: |
+          set -euo pipefail
+          COUNT=0
+          while IFS= read -r -d '' JS; do
+            test -s "$JS"
+            node --check "$JS"
+            COUNT=$((COUNT+1))
+          done < <(find artifact/UPLOAD_TO_SITEASSETS -maxdepth 1 -type f -name '*.js' -print0)
+          test "$COUNT" -gt 0
+          test -s artifact/UPLOAD_TO_APP_CATALOG/DispoPilot_Online_V1.3_SPFX_FINAL.sppkg
+
+          python3 - <<'PY_FINAL_039C'
+          from pathlib import Path
+          js=list(Path('artifact/UPLOAD_TO_SITEASSETS').glob('*.js'))
+          current=[]
+          for p in js:
+              s=p.read_text(encoding='utf-8')
+              if 'DP_DLB_039C_1_16_0_30_MATERIAL_STAMM_FELDER_FIX_BEGIN' in s:
+                  current.append((p,s))
+          if len(current)!=1:
+              raise SystemExit(f'039C FINAL: Produktionsbundle {len(current)}x statt 1x.')
+          _,s=current[0]
+          required=[
+              'DP_DLB_039B_1_16_0_28_RECOVERY_PRE_CLEAN_BEGIN',
+              'DP_DLB_036D_1_16_0_20_OFFLINE_OUTBOX_SYNC_BEGIN',
+              'DP_DLB_035B_1_16_0_16_AUFTRAG_KONTAKT_MEHRMULDEN_MATERIAL_BEGIN',
+              'dp39cMasterMaterialRows','dpR1MaterialOptions',"taskEl.value='Abholen'",
+              "else if(['Tauschen','Abholen','Leeren'].includes(task))globalMaterial?.classList.remove('hidden');",
+              "if(planned.length&&task!=='Tauschen'){",
+              "if(saved.task!=='Tauschen')saved.material=dp35Text(saved.plannedBinMaterials[0]);"
+          ]
+          missing=[x for x in required if x not in s]
+          if missing: raise SystemExit('039C FINAL fehlt: '+', '.join(missing))
+          start=s.find('function dp39cMasterMaterialRows('); stop=s.find('function dp35PlannedFromOrder(',start)
+          if start<0 or stop<0 or '(state?.materials||[])' in s[start:stop]:
+              raise SystemExit('039C FINAL: falsche Materialquelle noch aktiv.')
+          print('039C FINAL OK')
+          PY_FINAL_039C
+
+          cat > artifact/REIHENFOLGE.txt <<'TXT'
+          DLB-039C-1.16.0.30 · MATERIAL-STAMM + FELDER REGRESSION FIX · SPFx 1.3.6.124
+          - Basis DLB-039B / 1.16.0.29
+          - Stellen: ursprüngliche richtige Material-Stammdatenquelle
+          - Tauschen / Abholen / Leeren: Materialfeld wieder sichtbar und änderbar
+          - Tauschen: Alt-/Ist-Material bleibt getrennt vom geplanten Material der neu gestellten Mulde
+          - 039B Recovery und 036D Offline-Outbox bleiben erhalten
+          TXT
+
+      - name: Upload DLB-039C artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLB-039C-1.16.0.30-MATERIAL-STAMM-FELDER-FIX-SPFX-1.3.6.124
+          path: artifact/
+          if-no-files-found: error
