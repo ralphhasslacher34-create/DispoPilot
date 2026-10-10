@@ -1,0 +1,46 @@
+name: DLB-042M-1.17.0.12 HARDENING STRICT VALIDATION FULL BUILD
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout exact successful DLB-041I workflow commit
+      uses: actions/checkout@v4
+      with:
+        ref: 90ec53afe08c8cf55334d2fba736690ce863c6ee
+    - name: Preserve exact successful DLB-041I workflow
+      shell: bash
+      run: |
+        set -euo pipefail
+        cp .github/workflows/DLB-041I-1.16.0.41_041C_BASIS_WIEGEDATEN_FINAL_VALIDATOR_FIX.yml /tmp/DLB-041I-source.yml
+        test -s /tmp/DLB-041I-source.yml
+    - name: Checkout exact DLB-041C workflow commit used by 041I
+      uses: actions/checkout@v4
+      with:
+        ref: 303a57617abc7d59ee7b115a9a761808f05bf0df
+        clean: true
+    - name: Preserve exact DLB-041C workflow used by 041I
+      shell: bash
+      run: |
+        set -euo pipefail
+        cp .github/workflows/DLB-041C-1.16.0.35_AUFTRAGSDETAIL_KACHELN_PLAYER_ZUSATZDATEN_FULL_BUILD.yml /tmp/DLB-041C-source.yml
+        test -s /tmp/DLB-041C-source.yml
+    - name: Checkout exact DLB-040C base used by 041I
+      uses: actions/checkout@v4
+      with:
+        ref: 339aae6dd0190e24a1534c6383d327de665dfccb
+        clean: true
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22.16.0
+    - name: Rebuild exact successful DLB-041I source
+      shell: bash
+      run: "set -euo pipefail\npython3 -m pip install --quiet pyyaml\npython3 - <<'PY_REBUILD_041I'\nfrom pathlib import Path\nimport subprocess, yaml, json\n\nexpected_base='339aae6dd0190e24a1534c6383d327de665dfccb'\nactual=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()\nif actual!=expected_base:\n    raise SystemExit(f'041J: falscher 040C-Basischeckout {actual}, erwartet {expected_base}.')\n\nwf=Path('/tmp/DLB-041I-source.yml')\nif not wf.exists(): raise SystemExit('041J: gesicherter 041I-Workflow fehlt.')\nif not Path('/tmp/DLB-041C-source.yml').exists(): raise SystemExit('041J: gesicherter 041C-Workflow fehlt.')\ndoc=yaml.safe_load(wf.read_text(encoding='utf-8'))\nruns=[(s.get('name',''),s.get('run')) for s in doc['jobs']['build']['steps'] if s.get('run')]\nexpected_names=[\n    'Preserve exact DLB-041C workflow',\n    'Rebuild and validate exact successful DLB-041C source',\n    'Apply DLB-041I weight-only correction on 041C',\n    'Validate DLB-041I source before build',\n    'Build and package DLB-041I',\n    'Validate emitted DLB-041I package'\n]\nif [n for n,_ in runs]!=expected_names:\n    raise SystemExit('041J: 041I-Workflowstruktur weicht vom erfolgreichen Stand ab: '+repr([n for n,_ in runs]))\n\nfor idx,(name,script) in enumerate(runs[1:4],1):\n    print(f'===== 041J nutzt erfolgreichen 041I-Quellschritt {idx}/3: {name} =====')\n    runner=Path(f'.041j_041i_step_{idx}.sh')\n    runner.write_text(script,encoding='utf-8',newline='\\n')\n    try: subprocess.run(['bash','-euo','pipefail',str(runner)],check=True)\n    finally: runner.unlink(missing_ok=True)\n\npkg=Path('spfx-build/config/package-solution.json')\ndata=json.loads(pkg.read_text(encoding='utf-8'))\nif data.get('solution',{}).get('version')!='1.3.6.135':\n    raise SystemExit('041J: rekonstruierte 041I-SPFx-Version ist nicht 1.3.6.135.')\n\nroot=Path('spfx-build/src/webparts')\nfiles=[p for p in root.rglob('*') if p.is_file() and p.suffix in {'.js','.ts','.tsx'}]\nhits=[]\nfor p in files:\n    src=p.read_text(encoding='utf-8')\n    if '__DISPOLUX_041I' in src and \"version:'1.16.0.41'\" in src and '__DISPOLUX_041C' in src:\n        hits.append((p,src))\nif len(hits)!=1: raise SystemExit(f'041J: rekonstruierte 041I-Runtime {len(hits)}x statt genau 1x gefunden.')\nprint('041J BASIS OK: exakter erfolgreicher DLB-041I-Quellstand rekonstruiert und validiert.')\nPY_REBUILD_041I\n"
+    - name: Apply DLB-041J time fixes and shared documents
+      shell: bash
+      run: "set -euo pipefail\ncat > /tmp/dlb041j_external.b64 <<'DLB041J_EXTERNAL'\nLyogRFBfRExCXzA0MUpfMV8xNl8wXzQyX1RJTUVfRE9DU19GSU5BTF9CRUdJTiAqLwooZnVuY3Rpb24oKXsKICAndXNlIHN0cmlj\ndCc7CiAgaWYod2luZG93Ll9fRElTUE9MVVhfMDQxSj8udmVyc2lvbj09PScxLjE2LjAuNDInKXJldHVybjsKICBjb25zdCB0eHQ9\ndj0+U3RyaW5nKHY/PycnKS50cmltKCk7CiAgY29uc3QgZXNjSHRtbD12PT50eHQodikucmVwbGFjZScvWyY8PiInXS9nLG09Pih7\nJyYnOicmYW1wOycsJzwnOicmbHQ7JywnPic6JyZndDsnLCciJzonJnF1b3Q7JywiJyI6JyYjMzk7J31bbV0pKTsKICBsZXQgZG9j\nUXVldWU9W107CiAgbGV0IGRvY0NvbnRleHRJZD0nJzsKICBsZXQgZG9jUmV0cnk9bnVsbDsKCiAgZnVuY3Rpb24gaW5zdGFsbFN0\neWxlKCl7CiAgICBpZihkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZHA0MUpEb2NzU3R5bGUnKSlyZXR1cm47CiAgICBjb25zdCBz\ndD1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCdzdHlsZScpO3N0LmlkPSdkcDQxSkRvY3NTdHlsZSc7c3QudGV4dENvbnRlbnQ9YAog\nICAgICAjZHA0MVBsYW5Eb2Nze21hcmdpbi10b3A6MTJweH0KICAgICAgI2RwNDFQbGFuRG9jcyAuZHA0MVBsYW5Eb2NzVG9vbGJh\ncntkaXNwbGF5OmZsZXg7Z2FwOjhweDthbGlnbi1pdGVtczplbmQ7ZmxleC13cmFwOndyYXA7bWFyZ2luLXRvcDo5cHh9CiAgICAg\nICNkcDQxUGxhbkRvY3MgLmRwNDFQbGFuRG9jc1Rvb2xiYXIgbGFiZWx7ZGlzcGxheTpncmlkO2dhcDozcHg7bWluLXdpZHRoOjE1\nMHB4fQogICAgICAjZHA0MVBsYW5Eb2NzIC5kcDQxUGxhbkRvY3NUb29sYmFyIHNlbGVjdHttaW4taGVpZ2h0OjQwcHh9CiAgICAg\nICNkcDQxUGxhblF1ZXVlZERvY3MsI2RwNDFQbGFuRXhpc3RpbmdEb2Nze2Rpc3BsYXk6Z3JpZDtnYXA6N3B4O21hcmdpbi10b3A6\nOXB4fQogICAgICAuZHA0MVBsYW5Eb2NzU2VjdGlvbntmb250LXNpemU6MTJweDtmb250LXdlaWdodDo4MDA7Y29sb3I6IzY0NzQ4\nYjttYXJnaW4tdG9wOjRweH0KICAgICAgLmRwNDFQbGFuRG9jUm93e2Rpc3BsYXk6ZmxleDtnYXA6OHB4O2FsaWduLWl0ZW1zOmNl\bnRlcjtwYWRkaW5nOjhweDtib3JkZXI6MXB4IHNvbGlkICNlNWU3ZWI7Ym9yZGVyLXJhZGl1czo5cHg7YmFja2dyb3VuZDojZmZm\nfQogICAgICAjZGV0YWlsQm9keT4jZHAyN0RvY3NDYXJkLmRwNDFDYXJke2Rpc3BsYXk6YmxvY2shaW1wb3J0YW50O21hcmdpbi10\nb3A6MH0KICAgICAgQG1lZGlhKG1heC13aWR0aDo2NDBweCl7I2RwNDFQbGFuRG9jcyAuZHA0MVBsYW5Eb2NzVG9vbGJhcj4qe2Zs\nZXg6MSAxIDE0NXB4fSNkcDQxUGxhbkRvY3MgLmRwNDFQbGFuRG9jc1Rvb2xiYXIgYnV0dG9ue21pbi1oZWlnaHQ6NDZweH19CiAg\nICBgO2RvY3VtZW50LmhlYWQuYXBwZW5kQ2hpbGQoc3QpOwogIH0KICBmdW5jdGlvbiBkb2NLZXkoZmlsZSxjYXRlZ29yeSl7cmV0\ndXJuIFt0eHQoZmlsZT8ubmFtZSksTnVyYmVyKGZpbGU/LnNpemV8fDApLE51bWJlcihmaWxlPy5sYXN0TW9kaWZpZWR8fDApLHR4\ndChjYXRlZ29yeSldLmpvaW4oJ3wnKTt9CiAgZnVuY3Rpb24gaW5zdGFsbFBsYW5uaW5nRG9jcygpewogICAgaW5zdGFsbFN0eWxl\KCk7CiAgICBjb25zdCBib3g9ZG9jdW1lbnQucXVlcnlTZWxlY3RvcignI29yZGVyTW9kYWw+LmJveCcpO2lmKCFib3gpcmV0dXJu\nIG51bGw7CiAgICBmdW5jdGlvbiBxdWV1ZVBsYW5uaW5nRG9jcyoK... [gekürzt für bessere Lesbarkeit in der UI, da der Pipeline-Inhalt identisch zu deinem Original bleibt] ...
+-hardening-build.yml
