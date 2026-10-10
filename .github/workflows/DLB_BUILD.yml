@@ -1,0 +1,97 @@
+name: DLB BUILD
+
+# Baut DispoLux aus einem Quellcode-ZIP im Repository.
+# Ablauf: DLB_xxxx_SRC.zip oder die Teile DLB_xxxx_TEIL1.bin, TEIL2.bin ...
+# ins Hauptverzeichnis hochladen,
+# dann unter Actions "DLB BUILD" starten und das Kürzel eintragen.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kuerzel:
+        description: 'Kürzel, z. B. DLB_043A (Datei DLB_043A_SRC.zip muss im Repo liegen)'
+        required: true
+        default: 'DLB_043A'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      K: ${{ github.event.inputs.kuerzel }}
+    steps:
+      - name: Repository holen
+        uses: actions/checkout@v4
+
+      - name: Node.js einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.16.0
+
+      - name: Quellcode entpacken
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf work && mkdir work
+          if [ -f "${K}_SRC.zip" ]; then
+            cp "${K}_SRC.zip" work/src.zip
+          elif [ -f "${K}_TEIL1.bin" ]; then
+            i=1
+            while [ -f "${K}_TEIL${i}.bin" ]; do cat "${K}_TEIL${i}.bin" >> work/src.zip; i=$((i+1)); done
+            echo "$((i-1)) Teile zusammengesetzt."
+          else
+            echo "Weder ${K}_SRC.zip noch ${K}_TEIL1.bin im Repository gefunden."; exit 1
+          fi
+          unzip -q work/src.zip -d work || { echo "Quellcode-Paket ist beschaedigt oder ein Teil fehlt."; exit 1; }
+          test -f work/spfx-build/package.json
+          cat work/spfx-build/DLB_INFO.txt
+          grep -q "KUERZEL=${K}" work/spfx-build/DLB_INFO.txt || { echo "DLB_INFO.txt passt nicht zu ${K}."; exit 1; }
+
+      - name: Abhaengigkeiten installieren
+        working-directory: work/spfx-build
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --include=optional
+          SASS_PACKAGE=$(find node_modules -path '*/sass-embedded/package.json' -print -quit || true)
+          if [ -n "$SASS_PACKAGE" ]; then
+            SASS_VERSION=$(node -e "const p=require('./'+process.argv[1]);console.log((p.optionalDependencies&&p.optionalDependencies['sass-embedded-linux-x64'])||p.version)" "$SASS_PACKAGE")
+            npm install --no-save --include=optional "sass-embedded-linux-x64@$SASS_VERSION"
+          fi
+
+      - name: Bauen und paketieren
+        working-directory: work/spfx-build
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx heft build --production
+          npx heft package-solution --production
+
+      - name: Ergebnis zusammenstellen und pruefen
+        shell: bash
+        run: |
+          set -euo pipefail
+          MARKER=$(grep '^MARKER=' work/spfx-build/DLB_INFO.txt | cut -d= -f2)
+          rm -rf artifact && mkdir -p artifact/UPLOAD_TO_SITEASSETS artifact/UPLOAD_TO_APP_CATALOG
+          PKG=$(find work/spfx-build/sharepoint/solution -maxdepth 1 -name '*.sppkg' | head -n1)
+          test -n "$PKG"
+          cp "$PKG" "artifact/UPLOAD_TO_APP_CATALOG/${K}_DispoLux.sppkg"
+          if [ -d work/spfx-build/release/assets ]; then cp -a work/spfx-build/release/assets/. artifact/UPLOAD_TO_SITEASSETS/
+          elif [ -d work/spfx-build/temp/deploy ]; then cp -a work/spfx-build/temp/deploy/. artifact/UPLOAD_TO_SITEASSETS/
+          else echo "Keine Asset-Ausgabe gefunden."; exit 1; fi
+          COUNT=0; FOUND=0
+          for JS in artifact/UPLOAD_TO_SITEASSETS/*.js; do
+            node --check "$JS"; COUNT=$((COUNT+1))
+            if grep -q "$MARKER" "$JS"; then FOUND=$((FOUND+1)); fi
+          done
+          test "$COUNT" -gt 0
+          test "$FOUND" -eq 1 || { echo "Kennung $MARKER nicht genau einmal im Bundle gefunden."; exit 1; }
+          cp work/*_LIESMICH.txt artifact/ 2>/dev/null || true
+          cp work/spfx-build/DLB_INFO.txt artifact/
+          echo "OK: ${K} gebaut."
+
+      - name: Ergebnis hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.kuerzel }}_FERTIG
+          path: artifact/
+          if-no-files-found: error
